@@ -123,6 +123,30 @@ class Job:
         return LIGHT_BY_CATEGORY[self.category]
 
 
+@dataclass
+class PartitionSummary:
+    partition: str
+    availability: str = ""
+    max_time: str = ""
+    nodes_total: int = 0
+    nodes_idle: int = 0
+    nodes_allocated: int = 0
+    nodes_mixed: int = 0
+    nodes_down: int = 0
+    nodes_draining: int = 0
+    nodes_other: int = 0
+    jobs_queued: int = 0
+    jobs_running: int = 0
+    jobs_other: int = 0
+    user_queued: int = 0
+    user_running: int = 0
+
+    @property
+    def load_text(self) -> str:
+        active = self.nodes_allocated + self.nodes_mixed
+        return f"{active}/{self.nodes_total}" if self.nodes_total else "-"
+
+
 def clean_state(state: str) -> str:
     state = (state or "").strip().upper()
     if not state:
@@ -155,6 +179,18 @@ def split_ssh_host(value: str) -> Tuple[str, str]:
     if user and host:
         return user, host
     return "", value
+
+
+def normalize_partition(value: str) -> str:
+    value = clean_optional(value).rstrip("*")
+    return value or "unknown"
+
+
+def parse_int(value: str) -> int:
+    try:
+        return int(clean_optional(value))
+    except ValueError:
+        return 0
 
 
 def category_for_state(state: str) -> str:
@@ -259,7 +295,8 @@ def load_squeue_jobs(
             continue
         fields = split_row(line, 8)
         if fields is None:
-            warnings.append(f"could not parse squeue row: {line!r}")
+            if DELIM in line:
+                warnings.append(f"could not parse squeue row: {line!r}")
             continue
         job_id, state, job_name, partition, elapsed, time_limit, nodes, reason = fields
         jobs[job_id] = Job(
@@ -322,7 +359,8 @@ def load_sacct_jobs(
             continue
         row = split_row(line, len(fields))
         if row is None:
-            warnings.append(f"could not parse sacct row: {line!r}")
+            if DELIM in line:
+                warnings.append(f"could not parse sacct row: {line!r}")
             continue
         (
             job_id,
@@ -355,6 +393,83 @@ def load_sacct_jobs(
         )
 
     return jobs, warnings
+
+
+def add_node_state(summary: PartitionSummary, state: str, count: int) -> None:
+    state = clean_optional(state).lower()
+    summary.nodes_total += count
+    if "idle" in state:
+        summary.nodes_idle += count
+    elif "alloc" in state:
+        summary.nodes_allocated += count
+    elif "mix" in state:
+        summary.nodes_mixed += count
+    elif "drain" in state or "drng" in state:
+        summary.nodes_draining += count
+    elif "down" in state or "fail" in state:
+        summary.nodes_down += count
+    else:
+        summary.nodes_other += count
+
+
+def load_sinfo_partitions(
+    runner: CommandRunner,
+) -> Tuple[Dict[str, PartitionSummary], List[str]]:
+    fmt = DELIM.join(["%P", "%a", "%l", "%D", "%T"])
+    output, error = run_command(["sinfo", "-h", "-o", fmt], runner)
+    warnings = [error] if error else []
+    partitions: Dict[str, PartitionSummary] = {}
+
+    for line in output.splitlines():
+        if not line.strip():
+            continue
+        fields = split_row(line, 5)
+        if fields is None:
+            if DELIM in line:
+                warnings.append(f"could not parse sinfo row: {line!r}")
+            continue
+        raw_partition, availability, max_time, nodes, node_state = fields
+        partition = normalize_partition(raw_partition)
+        summary = partitions.setdefault(partition, PartitionSummary(partition=partition))
+        if availability.lower() == "up" or not summary.availability:
+            summary.availability = availability
+        if max_time and not summary.max_time:
+            summary.max_time = max_time
+        add_node_state(summary, node_state, parse_int(nodes))
+
+    return partitions, warnings
+
+
+def load_partition_queue_counts(
+    runner: CommandRunner,
+) -> Tuple[Dict[str, Dict[str, int]], List[str]]:
+    fmt = DELIM.join(["%P", "%T"])
+    output, error = run_command(["squeue", "-h", "-o", fmt], runner)
+    warnings = [error] if error else []
+    counts: Dict[str, Dict[str, int]] = {}
+
+    for line in output.splitlines():
+        if not line.strip():
+            continue
+        fields = split_row(line, 2)
+        if fields is None:
+            if DELIM in line:
+                warnings.append(f"could not parse partition squeue row: {line!r}")
+            continue
+        partition, state = fields
+        category = category_for_state(state)
+        bucket = counts.setdefault(
+            normalize_partition(partition),
+            {"queued": 0, "running": 0, "other": 0},
+        )
+        if category == "queued":
+            bucket["queued"] += 1
+        elif category == "running":
+            bucket["running"] += 1
+        else:
+            bucket["other"] += 1
+
+    return counts, warnings
 
 
 def init_db(path: str) -> sqlite3.Connection:
@@ -578,6 +693,48 @@ def combine_jobs(active: Dict[str, Job], accounted: Dict[str, Job]) -> Dict[str,
     return combined
 
 
+def partition_sort_key(summary: PartitionSummary) -> Tuple[int, int, int, str]:
+    availability_rank = 0 if summary.availability.lower() == "up" else 1
+    return (
+        availability_rank,
+        -(summary.jobs_queued + summary.jobs_running),
+        -summary.nodes_total,
+        summary.partition,
+    )
+
+
+def load_partition_summaries(
+    runner: CommandRunner,
+    active_user_jobs: Dict[str, Job],
+) -> Tuple[List[PartitionSummary], List[str]]:
+    partitions, warnings = load_sinfo_partitions(runner)
+    queue_counts, queue_warnings = load_partition_queue_counts(runner)
+    warnings.extend(queue_warnings)
+
+    for partition, counts in queue_counts.items():
+        summary = partitions.setdefault(
+            partition,
+            PartitionSummary(partition=partition),
+        )
+        summary.jobs_queued = counts.get("queued", 0)
+        summary.jobs_running = counts.get("running", 0)
+        summary.jobs_other = counts.get("other", 0)
+
+    for job in active_user_jobs.values():
+        summary = partitions.setdefault(
+            normalize_partition(job.partition),
+            PartitionSummary(partition=normalize_partition(job.partition)),
+        )
+        if job.category == "queued":
+            summary.user_queued += 1
+        elif job.category == "running":
+            summary.user_running += 1
+
+    result = list(partitions.values())
+    result.sort(key=partition_sort_key)
+    return result, warnings
+
+
 def poll_jobs(
     conn: sqlite3.Connection,
     runner: CommandRunner,
@@ -586,7 +743,7 @@ def poll_jobs(
     since_days: int,
     no_sacct: bool,
     limit: int,
-) -> Tuple[List[Job], List[str]]:
+) -> Tuple[List[Job], List[PartitionSummary], List[str]]:
     since = datetime.now() - timedelta(days=since_days)
     active, warnings = load_squeue_jobs(runner, user, job_ids)
     accounted: Dict[str, Job] = {}
@@ -596,7 +753,9 @@ def poll_jobs(
 
     current = combine_jobs(active, accounted)
     record_jobs(conn, current.values())
-    return choose_display_jobs(conn, active, limit), warnings
+    partitions, partition_warnings = load_partition_summaries(runner, active)
+    warnings.extend(partition_warnings)
+    return choose_display_jobs(conn, active, limit), partitions, warnings
 
 
 def count_jobs(jobs: Iterable[Job]) -> Dict[str, int]:
@@ -687,12 +846,34 @@ def job_to_dict(job: Job) -> Dict[str, str]:
     }
 
 
+def partition_to_dict(summary: PartitionSummary) -> Dict[str, object]:
+    return {
+        "partition": summary.partition,
+        "availability": summary.availability,
+        "max_time": summary.max_time,
+        "nodes_total": summary.nodes_total,
+        "nodes_idle": summary.nodes_idle,
+        "nodes_allocated": summary.nodes_allocated,
+        "nodes_mixed": summary.nodes_mixed,
+        "nodes_down": summary.nodes_down,
+        "nodes_draining": summary.nodes_draining,
+        "nodes_other": summary.nodes_other,
+        "load_text": summary.load_text,
+        "jobs_queued": summary.jobs_queued,
+        "jobs_running": summary.jobs_running,
+        "jobs_other": summary.jobs_other,
+        "user_queued": summary.user_queued,
+        "user_running": summary.user_running,
+    }
+
+
 def terminal_width() -> int:
     return shutil.get_terminal_size((120, 30)).columns
 
 
 def render(
     jobs: Sequence[Job],
+    partitions: Sequence[PartitionSummary],
     warnings: Sequence[str],
     db_path: str,
     backend_label: str,
@@ -731,6 +912,32 @@ def render(
 
     if not jobs:
         print("No jobs found yet. Waiting for squeue/sacct data...")
+
+    if partitions:
+        print("Partitions:")
+        print(
+            f"{'PARTITION':<14} {'AVAIL':<7} {'QUEUED':>6} {'RUN':>5} "
+            f"{'MINE_Q':>6} {'MINE_R':>6} {'NODES':>9} "
+            f"{'IDLE':>5} {'DOWN':>5} {'DRAIN':>5} {'LIMIT':>10}"
+        )
+        print("-" * min(width, 100))
+        for part in partitions[:20]:
+            print(
+                f"{truncate(part.partition, 14):<14} "
+                f"{truncate(part.availability, 7):<7} "
+                f"{part.jobs_queued:>6} "
+                f"{part.jobs_running:>5} "
+                f"{part.user_queued:>6} "
+                f"{part.user_running:>6} "
+                f"{part.load_text:>9} "
+                f"{part.nodes_idle:>5} "
+                f"{part.nodes_down:>5} "
+                f"{part.nodes_draining:>5} "
+                f"{truncate(part.max_time, 10):>10}"
+            )
+        print()
+
+    if not jobs:
         return
 
     fixed_width = 2 + 1 + 18 + 1 + 13 + 1 + 22 + 1 + 12 + 1 + 10 + 1 + 10 + 1 + 5 + 1
@@ -774,6 +981,11 @@ WEB_HTML = r"""<!doctype html>
   --green-light: #2fbf71;
   --red-light: #d94b4b;
   --gray-light: #9aa4b2;
+  --node-red: #d94b4b;
+  --node-yellow: #f2c94c;
+  --node-blue: #3b82d6;
+  --node-green: #2fbf71;
+  --node-gray: #9aa4b2;
 }
 * { box-sizing: border-box; }
 body {
@@ -868,6 +1080,109 @@ h1 {
   color: var(--muted);
   font-size: 13px;
 }
+.partition-strip {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+  gap: 10px;
+  margin-bottom: 26px;
+}
+.partition-item {
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #ffffff;
+  padding: 10px 12px;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+  width: 100%;
+}
+.partition-item:hover,
+.partition-item:focus-visible {
+  border-color: #9aa4b2;
+  outline: 3px solid rgba(31, 41, 51, 0.12);
+  outline-offset: 2px;
+}
+.partition-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+.partition-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  font-weight: 650;
+}
+.partition-avail {
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  padding: 2px 7px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.4;
+  white-space: nowrap;
+}
+.partition-avail[data-up="true"] {
+  color: #17633a;
+  border-color: rgba(47, 191, 113, 0.4);
+}
+.partition-metrics {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+.partition-body {
+  display: grid;
+  grid-template-columns: 62px minmax(0, 1fr);
+  gap: 12px;
+  align-items: center;
+}
+.partition-pie {
+  position: relative;
+  width: 62px;
+  height: 62px;
+  border-radius: 50%;
+  background: var(--node-gray);
+  box-shadow:
+    inset 0 0 0 1px rgba(31, 41, 51, 0.14),
+    0 4px 10px rgba(31, 41, 51, 0.1);
+}
+.partition-pie::after {
+  content: "";
+  position: absolute;
+  inset: 17px;
+  border-radius: 50%;
+  background: #ffffff;
+  box-shadow: inset 0 0 0 1px rgba(31, 41, 51, 0.08);
+}
+.partition-pie-total {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+}
+.metric-label {
+  display: block;
+  color: var(--muted);
+  font-size: 10px;
+}
+.metric-value {
+  display: block;
+  margin-top: 2px;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
 .backdrop {
   position: fixed;
   inset: 0;
@@ -915,6 +1230,71 @@ h1 {
   line-height: 1;
   cursor: pointer;
 }
+.node-chart-section {
+  display: grid;
+  grid-template-columns: 132px minmax(0, 1fr);
+  gap: 16px;
+  align-items: center;
+  padding: 18px 22px;
+  border-bottom: 1px solid var(--line);
+}
+.node-pie {
+  position: relative;
+  width: 132px;
+  height: 132px;
+  border-radius: 50%;
+  background: var(--node-gray);
+  box-shadow:
+    inset 0 0 0 1px rgba(31, 41, 51, 0.14),
+    0 8px 20px rgba(31, 41, 51, 0.12);
+}
+.node-pie::after {
+  content: "";
+  position: absolute;
+  inset: 34px;
+  border-radius: 50%;
+  background: var(--panel);
+  box-shadow: inset 0 0 0 1px rgba(31, 41, 51, 0.08);
+}
+.node-pie-total {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 16px;
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+}
+.node-legend {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+.node-legend-row {
+  display: grid;
+  grid-template-columns: 12px minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+  font-size: 12px;
+}
+.node-swatch {
+  width: 12px;
+  height: 12px;
+  border-radius: 3px;
+  box-shadow: inset 0 0 0 1px rgba(31, 41, 51, 0.16);
+}
+.node-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.node-value {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
 .details {
   display: grid;
   grid-template-columns: 120px 1fr;
@@ -959,6 +1339,16 @@ h1 {
     width: 32px;
     height: 32px;
   }
+  .node-chart-section {
+    grid-template-columns: 112px minmax(0, 1fr);
+  }
+  .node-pie {
+    width: 112px;
+    height: 112px;
+  }
+  .node-pie::after {
+    inset: 29px;
+  }
 }
 </style>
 </head>
@@ -968,7 +1358,8 @@ h1 {
   <div class="summary" id="summary"></div>
 </header>
 <main class="wrap">
-  <div class="status-line" id="status"></div>
+  <div class="status-line" id="status">Loading Slurm data...</div>
+  <section class="partition-strip" id="partitions" aria-label="Partitions"></section>
   <section class="light-grid" id="lights" aria-label="Slurm jobs"></section>
 </main>
 <div class="backdrop" id="backdrop" hidden></div>
@@ -980,10 +1371,17 @@ h1 {
     </div>
     <button class="close" id="close" type="button" aria-label="Close">&times;</button>
   </div>
+  <section class="node-chart-section" id="node-chart" hidden>
+    <div class="node-pie" id="node-pie" aria-label="Node state pie chart">
+      <span class="node-pie-total" id="node-pie-total"></span>
+    </div>
+    <div class="node-legend" id="node-legend"></div>
+  </section>
   <dl class="details" id="details"></dl>
 </aside>
 <script>
 const lights = document.getElementById("lights");
+const partitions = document.getElementById("partitions");
 const summary = document.getElementById("summary");
 const statusLine = document.getElementById("status");
 const detail = document.getElementById("detail");
@@ -991,9 +1389,14 @@ const backdrop = document.getElementById("backdrop");
 const detailTitle = document.getElementById("detail-title");
 const detailSubtitle = document.getElementById("detail-subtitle");
 const details = document.getElementById("details");
+const nodeChart = document.getElementById("node-chart");
+const nodePie = document.getElementById("node-pie");
+const nodePieTotal = document.getElementById("node-pie-total");
+const nodeLegend = document.getElementById("node-legend");
 const closeButton = document.getElementById("close");
 let jobsById = new Map();
 let selectedJobId = null;
+let selectedPartitionName = null;
 let refreshTimer = null;
 
 function text(value) {
@@ -1008,7 +1411,57 @@ function escapeHtml(value) {
     .replaceAll('"', "&quot;");
 }
 
+function percent(value, total) {
+  if (!total) return "0.0%";
+  return `${((Number(value || 0) / total) * 100).toFixed(1)}%`;
+}
+
+function nodeSlices(partition) {
+  return [
+    ["Down", Number(partition.nodes_down || 0), "var(--node-red)"],
+    ["Draining", Number(partition.nodes_draining || 0), "var(--node-red)"],
+    ["Allocated", Number(partition.nodes_allocated || 0), "var(--node-yellow)"],
+    ["Mixed", Number(partition.nodes_mixed || 0), "var(--node-blue)"],
+    ["Idle", Number(partition.nodes_idle || 0), "var(--node-green)"],
+    ["Other", Number(partition.nodes_other || 0), "var(--node-gray)"],
+  ];
+}
+
+function nodePieGradient(slices, total) {
+  if (!total) return "var(--node-gray)";
+  let cursor = 0;
+  const segments = [];
+  slices.forEach(([, value, color]) => {
+    if (!value) return;
+    const start = cursor;
+    cursor += (value / total) * 360;
+    segments.push(`${color} ${start.toFixed(3)}deg ${cursor.toFixed(3)}deg`);
+  });
+  return segments.length
+    ? `conic-gradient(${segments.join(", ")})`
+    : "var(--node-gray)";
+}
+
+function renderNodeChart(partition) {
+  const slices = nodeSlices(partition);
+  const total = slices.reduce((sum, [, value]) => sum + value, 0);
+  nodePie.style.background = nodePieGradient(slices, total);
+  nodePieTotal.textContent = String(total);
+  nodeLegend.innerHTML = slices.map(([label, value, color]) => `
+    <div class="node-legend-row">
+      <span class="node-swatch" style="background: ${color}"></span>
+      <span class="node-label">${escapeHtml(label)}</span>
+      <span class="node-value">${escapeHtml(value)} (${escapeHtml(percent(value, total))})</span>
+    </div>
+  `).join("");
+  nodeChart.hidden = false;
+}
+
 function renderSummary(data) {
+  if (data.error) {
+    summary.innerHTML = `<span>${escapeHtml(data.backend || "backend unknown")}</span>`;
+    return;
+  }
   const counts = data.counts || {};
   const items = [
     ["yellow", counts.queued || 0],
@@ -1024,6 +1477,8 @@ function renderSummary(data) {
 
 function openDetail(job) {
   selectedJobId = job.job_id;
+  selectedPartitionName = null;
+  nodeChart.hidden = true;
   detailTitle.textContent = `${job.job_id}  ${job.state}`;
   detailSubtitle.textContent = job.job_name || job.partition || "";
   const fields = [
@@ -1049,8 +1504,42 @@ function openDetail(job) {
   backdrop.hidden = false;
 }
 
+function openPartitionDetail(partition) {
+  selectedJobId = null;
+  selectedPartitionName = partition.partition;
+  const downTotal = Number(partition.nodes_down || 0) + Number(partition.nodes_draining || 0);
+  detailTitle.textContent = partition.partition;
+  detailSubtitle.textContent = `Availability ${text(partition.availability)}`;
+  renderNodeChart(partition);
+  const fields = [
+    ["Availability", partition.availability],
+    ["Max Time", partition.max_time],
+    ["Queue Jobs", partition.jobs_queued],
+    ["Running Jobs", partition.jobs_running],
+    ["Other Jobs", partition.jobs_other],
+    ["My Queued", partition.user_queued],
+    ["My Running", partition.user_running],
+    ["Nodes Used", partition.load_text],
+    ["Nodes Total", partition.nodes_total],
+    ["Nodes Idle", partition.nodes_idle],
+    ["Nodes Allocated", partition.nodes_allocated],
+    ["Nodes Mixed", partition.nodes_mixed],
+    ["Nodes Down", partition.nodes_down],
+    ["Nodes Draining", partition.nodes_draining],
+    ["Nodes Down+Drain", downTotal],
+    ["Nodes Other", partition.nodes_other],
+  ];
+  details.innerHTML = fields.map(([key, value]) =>
+    `<dt>${escapeHtml(key)}</dt><dd>${escapeHtml(value)}</dd>`
+  ).join("");
+  detail.hidden = false;
+  backdrop.hidden = false;
+}
+
 function closeDetail() {
   selectedJobId = null;
+  selectedPartitionName = null;
+  nodeChart.hidden = true;
   detail.hidden = true;
   backdrop.hidden = true;
 }
@@ -1073,12 +1562,62 @@ function renderLights(data) {
   }
 }
 
+function renderPartitions(data) {
+  partitions.replaceChildren();
+  (data.partitions || []).forEach(partition => {
+    const item = document.createElement("button");
+    item.type = "button";
+    item.className = "partition-item";
+    const isUp = String(partition.availability || "").toLowerCase() === "up";
+    item.title = `${partition.partition} availability ${partition.availability}`;
+    item.setAttribute("aria-label", item.title);
+    const slices = nodeSlices(partition);
+    const nodeTotal = slices.reduce((sum, [, value]) => sum + value, 0);
+    item.innerHTML = `
+      <div class="partition-head">
+        <div class="partition-name" title="${escapeHtml(partition.partition)}">${escapeHtml(partition.partition)}</div>
+        <div class="partition-avail" data-up="${isUp}" title="Partition availability from sinfo">Avail ${escapeHtml(partition.availability)}</div>
+      </div>
+      <div class="partition-body">
+        <div class="partition-pie" style="background: ${nodePieGradient(slices, nodeTotal)}" aria-label="Node state pie chart">
+          <span class="partition-pie-total">${escapeHtml(nodeTotal)}</span>
+        </div>
+        <div class="partition-metrics">
+          <div><span class="metric-label">Queue</span><span class="metric-value">${escapeHtml(partition.jobs_queued)}</span></div>
+          <div><span class="metric-label">Run</span><span class="metric-value">${escapeHtml(partition.jobs_running)}</span></div>
+          <div><span class="metric-label">Mine</span><span class="metric-value">${escapeHtml(partition.user_queued)} / ${escapeHtml(partition.user_running)}</span></div>
+          <div><span class="metric-label">Nodes</span><span class="metric-value">${escapeHtml(partition.load_text)}</span></div>
+          <div><span class="metric-label">Idle</span><span class="metric-value">${escapeHtml(partition.nodes_idle)}</span></div>
+          <div><span class="metric-label">Down</span><span class="metric-value">${escapeHtml(partition.nodes_down + partition.nodes_draining)}</span></div>
+        </div>
+      </div>`;
+    item.addEventListener("click", () => openPartitionDetail(partition));
+    partitions.appendChild(item);
+  });
+  if (selectedPartitionName) {
+    const selected = (data.partitions || []).find(
+      partition => partition.partition === selectedPartitionName
+    );
+    if (selected) openPartitionDetail(selected);
+  }
+}
+
 async function refresh() {
   try {
     const response = await fetch("/api/jobs", { cache: "no-store" });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const data = await response.json();
     renderSummary(data);
+    if (data.error) {
+      partitions.replaceChildren();
+      lights.replaceChildren();
+      statusLine.textContent = data.error;
+      if (!refreshTimer) {
+        refreshTimer = window.setInterval(refresh, data.refresh_ms || 10000);
+      }
+      return;
+    }
+    renderPartitions(data);
     renderLights(data);
     statusLine.textContent = data.warnings && data.warnings.length
       ? data.warnings[data.warnings.length - 1]
@@ -1143,21 +1682,27 @@ class TrackerRequestHandler(BaseHTTPRequestHandler):
 
     def send_text(self, body: str, content_type: str) -> None:
         encoded = body.encode("utf-8")
-        self.send_response(200)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(encoded)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        self.wfile.write(encoded)
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(encoded)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(encoded)
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+            return
 
     def send_json(self, payload: Dict[str, object]) -> None:
         encoded = json.dumps(payload, ensure_ascii=True).encode("utf-8")
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(encoded)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        self.wfile.write(encoded)
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(encoded)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(encoded)
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+            return
 
     def send_jobs(self, query: str) -> None:
         config = self.server.config
@@ -1169,20 +1714,36 @@ class TrackerRequestHandler(BaseHTTPRequestHandler):
             except (TypeError, ValueError):
                 limit = config.limit
 
-        with self.server.db_lock:
-            conn = init_db(config.db_path)
-            try:
-                jobs, warnings = poll_jobs(
-                    conn,
-                    config.runner,
-                    config.user,
-                    config.job_ids,
-                    config.since_days,
-                    config.no_sacct,
-                    limit,
-                )
-            finally:
-                conn.close()
+        try:
+            with self.server.db_lock:
+                conn = init_db(config.db_path)
+                try:
+                    jobs, partitions, warnings = poll_jobs(
+                        conn,
+                        config.runner,
+                        config.user,
+                        config.job_ids,
+                        config.since_days,
+                        config.no_sacct,
+                        limit,
+                    )
+                finally:
+                    conn.close()
+        except Exception as exc:
+            self.send_json(
+                {
+                    "updated_at": now_iso(),
+                    "refresh_ms": config.interval * 1000,
+                    "limit": limit,
+                    "backend": config.runner.label,
+                    "counts": count_jobs([]),
+                    "warnings": [],
+                    "partitions": [],
+                    "jobs": [],
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+            return
 
         self.send_json(
             {
@@ -1192,6 +1753,7 @@ class TrackerRequestHandler(BaseHTTPRequestHandler):
                 "backend": config.runner.label,
                 "counts": count_jobs(jobs),
                 "warnings": warnings,
+                "partitions": [partition_to_dict(part) for part in partitions],
                 "jobs": [job_to_dict(job) for job in jobs],
             }
         )
@@ -1387,13 +1949,21 @@ def local_slurm_available(no_sacct: bool) -> bool:
 
 def resolve_runner(args: argparse.Namespace) -> Tuple[Optional[CommandRunner], Optional[str]]:
     host_user, ssh_host = split_ssh_host(args.ssh_host)
+    explicit_ssh_user = clean_optional(args.ssh_user)
+    if host_user and explicit_ssh_user and host_user != explicit_ssh_user:
+        return (
+            None,
+            "--ssh-host looks like user@host, but --ssh-user is different. "
+            "Use either --ssh-host sycamore.unc.edu --ssh-user lsr "
+            "or --ssh-host lsr@sycamore.unc.edu.",
+        )
     user = (
         clean_optional(args.user)
-        or clean_optional(args.ssh_user)
+        or explicit_ssh_user
         or host_user
         or getpass.getuser()
     )
-    ssh_user = clean_optional(args.ssh_user) or host_user or user
+    ssh_user = explicit_ssh_user or host_user or user
     is_windows = platform.system().lower() == "windows"
 
     if args.backend == "local":
@@ -1482,7 +2052,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     signal.signal(signal.SIGTERM, handle_stop)
 
     while not stop:
-        displayed, warnings = poll_jobs(
+        displayed, partitions, warnings = poll_jobs(
             conn,
             runner,
             args.user,
@@ -1493,6 +2063,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
         render(
             displayed,
+            partitions,
             warnings,
             db_path,
             runner.label,

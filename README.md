@@ -1,73 +1,111 @@
 # Slurm Tracker
 
-本目录里的 `slurm_tracker.py` 是一个零依赖 Python 监控脚本，用来实时查看 Slurm 任务状态，并把状态变化记录到本地 SQLite 数据库。
+`slurm_tracker.py` is a zero-dependency Python monitor for Slurm jobs. It shows live job status, records status changes in a local SQLite database, and provides both a terminal view and a local Web UI.
 
-状态灯规则：
+Status lights:
 
-- 白灯：运行中，例如 `RUNNING`
-- 绿灯：运行完成，例如 `COMPLETED`
-- 黄灯：排队中，例如 `PENDING`
-- 红灯：已结束但报错，例如 `FAILED`、`TIMEOUT`、`CANCELLED`、`OUT_OF_MEMORY`
+- White: running, for example `RUNNING`
+- Green: completed, for example `COMPLETED`
+- Yellow: queued, for example `PENDING`
+- Red: ended with an error, for example `FAILED`, `TIMEOUT`, `CANCELLED`, or `OUT_OF_MEMORY`
 
-## 运行
+## Run
 
 ```bash
 python3 slurm_tracker.py
 ```
 
-默认每 10 秒刷新一次，监控当前用户，显示 20 个任务，并在当前目录写入：
+By default, the tracker refreshes every 10 seconds, monitors the current user, displays 20 recent jobs, and writes a local database in the current directory:
 
 ```text
 slurm_jobs.sqlite3
 ```
 
-显示顺序：
+Display order:
 
-- 当前排队任务优先
-- 当前运行任务其次
-- 已结束任务按结束时间从新到旧排序
+- Queued jobs first
+- Running jobs next
+- Finished jobs sorted by end time, newest first
 
 ## Web UI
 
-启动本地浏览器界面：
+Start the local browser UI:
 
 ```bash
 ./slurm_tracker.py --web
 ```
 
-默认地址：
+Default URL:
 
 ```text
 http://127.0.0.1:8765/
 ```
 
-主界面只显示任务状态灯，点击某个灯会显示该任务详情。
+The main job view is a grid of status lights. Click a light to open job details.
 
-## Windows 远程查询登录节点
+The top of the page also shows a partition summary:
 
-在 Windows 上运行时，脚本会检测系统；如果配置了 SSH 登录节点，会通过 SSH 到登录节点执行 `squeue` 和 `sacct`，然后把结果记录在 Windows 本地的 `slurm_jobs.sqlite3`。
+- `Queue`: all queued jobs in that partition
+- `Run`: all running jobs in that partition
+- `Mine`: your queued / running jobs
+- `Nodes`: allocated or mixed nodes / total nodes
+- `Idle`: idle nodes
+- `Down`: down or draining nodes
+- `Avail up`: partition availability from `sinfo`; `up` means the partition is currently available
 
-先确认 Windows 终端里能登录节点并执行 Slurm 命令：
+Each partition card includes a small node-state pie chart. Click a partition card to open a larger pie chart, legend, and full details.
+
+Node-state colors:
+
+- Red: `down` and `draining`
+- Yellow: `allocated`
+- Blue: `mixed`
+- Green: `idle`
+- Gray: `other`
+
+## Windows With SSH Login Node
+
+On Windows, the script can run locally and query Slurm through SSH on a login node. It executes `squeue`, `sacct`, and `sinfo` remotely, then stores the results in the Windows-local `slurm_jobs.sqlite3`.
+
+First verify that SSH can run Slurm commands from PowerShell or Command Prompt:
 
 ```powershell
 ssh your_user@login-node.example.edu squeue -u your_user
 ```
 
-启动 Web UI：
+Start the Web UI:
 
 ```powershell
 python slurm_tracker.py --web --ssh-host login-node.example.edu --ssh-user your_user --user your_user
 ```
 
-如果 Windows 报端口权限或占用问题，直接让系统选择空闲端口：
+If Windows blocks or reserves the default port, let the OS choose a free port:
 
 ```powershell
 python slurm_tracker.py --web --port 0 --ssh-host your_user@login-node.example.edu --user your_user
 ```
 
-脚本会在终端打印实际访问地址，例如 `http://127.0.0.1:51234/`。
+The script prints the actual URL, for example:
 
-也可以用环境变量，之后直接运行脚本：
+```text
+http://127.0.0.1:51234/
+```
+
+UNC Sycamore examples:
+
+```powershell
+python slurm_tracker.py --web --port 0 --ssh-host sycamore.unc.edu --ssh-user lsr --user lsr
+```
+
+or:
+
+```powershell
+python slurm_tracker.py --web --port 0 --ssh-host lsr@sycamore.unc.edu --user lsr
+```
+
+Do not use `sycamore@unc.edu`; that is parsed as a `user@host` value and points to the wrong host.
+
+You can also configure SSH with environment variables:
 
 ```powershell
 $env:SLURM_TRACKER_SSH_HOST = "login-node.example.edu"
@@ -76,62 +114,80 @@ $env:SLURM_TRACKER_USER = "your_user"
 python slurm_tracker.py --web
 ```
 
-如果需要指定私钥：
+If you need a specific private key:
 
 ```powershell
 python slurm_tracker.py --web --ssh-host login-node.example.edu --ssh-user your_user --ssh-key C:\Users\you\.ssh\id_ed25519
 ```
 
-默认 SSH 使用 `BatchMode=yes`，适合已经配置好免密登录的情况。如果还没配置免密，可以先在终端里完成 SSH key 配置；不建议让 Web UI 轮询时等待密码输入。
+SSH uses `BatchMode=yes` by default, which is best for key-based login. If key-based login is not set up yet, configure it first in your terminal. Avoid relying on interactive password prompts while the Web UI is polling.
 
-只试跑一次并记录本地数据库：
+## Useful Commands
+
+Poll once, write the local database, print output, then exit:
 
 ```bash
 python3 slurm_tracker.py --once
 ```
 
-调整刷新间隔：
+Change refresh interval:
 
 ```bash
 python3 slurm_tracker.py --interval 5
 ```
 
-只看某个任务：
+Monitor one job:
 
 ```bash
 python3 slurm_tracker.py --job-id 123456
 ```
 
-显示更多任务：
+Show more jobs:
 
 ```bash
 python3 slurm_tracker.py --limit 50
 ```
 
-指定用户或数据库路径：
+Specify user or database path:
 
 ```bash
 python3 slurm_tracker.py --user "$USER" --db ./slurm_jobs.sqlite3
 ```
 
-如果集群暂时不能用 `sacct`，可以只用 `squeue`：
+If `sacct` is unavailable on the cluster, use only `squeue`:
 
 ```bash
 python3 slurm_tracker.py --no-sacct
 ```
 
-注意：只用 `squeue` 时，已经完成或失败并从队列里消失的任务可能无法被识别；完整的完成/失败记录依赖 `sacct`。
+Note: with `--no-sacct`, completed or failed jobs may disappear once they leave `squeue`. Reliable completed/error history depends on `sacct`.
 
-## 查看本地记录
+## Local History
 
-查看当前任务表：
+Inspect the current job table:
 
 ```bash
 sqlite3 slurm_jobs.sqlite3 'select job_id,state,light,last_seen from jobs order by last_seen desc limit 20;'
 ```
 
-查看状态变化历史：
+Inspect status-change events:
 
 ```bash
 sqlite3 slurm_jobs.sqlite3 'select job_id,old_state,new_state,new_light,seen_at from events order by seen_at desc limit 20;'
+```
+
+## Troubleshooting
+
+If the Web page opens but shows no data, open the JSON endpoint printed by the server:
+
+```text
+http://127.0.0.1:PORT/api/jobs
+```
+
+Check the `warnings` or `error` fields.
+
+If the backend line shows the wrong host, stop the server and verify your SSH options. For Sycamore it should look like:
+
+```text
+Backend: ssh:lsr@sycamore.unc.edu
 ```
