@@ -45,19 +45,24 @@ The main job view is a grid of status lights. Click a light to open job details.
 
 The top of the page also shows a partition summary:
 
-- `Allocated CPUs`: allocated CPUs / total CPUs
-- `Unallocated`: idle CPUs reported by Slurm, including spare CPUs on mixed nodes; not necessarily available to your jobs
+- `Partition job CPUs`: CPUs assigned to active jobs submitted to this partition, from `squeue`; pending requests and suspended jobs are excluded
+- `My CPUs / QoS cap`: your allocation across partitions sharing the partition QoS / its per-user CPU cap. Without a reported cap, `My CPUs` shows your allocation in this partition
 - `My queued`: your pending jobs in the current query
 - `State up`: the partition state from `sinfo`, not a guarantee that a job can start
 
-CPU counts come directly from `sinfo %C` (allocated/idle/other/total), summed per partition, rather than multiplying occupied nodes by cores per node. A CPU is the unit configured in Slurm: a physical core or a hardware thread, depending on the cluster. This measures allocation, not live CPU utilization. Partitions can share nodes; adding their capacities does not give the cluster's total capacity. The terminal partition table also uses CPU counts (`CPUS A/T` means allocated / total; `UNALLOC` means unallocated). Missing or incomplete CPU counts display as `-`.
+Cards use per-job allocations from `squeue --array`, expanding job arrays for counting. Partition QoS is read from `scontrol show partition -o`, and its per-user CPU cap comes from `sacctmgr show qos` (`MaxTRESPU`), without hardcoded cluster limits. A job's own QoS may be `normal` while a partition QoS also applies. Job QoS and account limits can impose additional constraints. Failed CPU queries display as `-`.
 
-Cards use a thin CPU-allocation bar and three key metrics with more spacing. Click a card to open the pie chart, legend, full CPU and node counts, and global/personal job counts. `My Pending Reasons` groups the current query's pending jobs by the reason reported by `squeue %R`, such as `Priority` or `Dependency`. Unallocated CPUs may be fragmented across nodes or constrained by memory, reservations, time limits, QoS, priority, or dependencies. Spare CPU totals alone cannot establish whether a specific job can start.
+The [UNC Sycamore partition guide](https://help.rc.unc.edu/sycamore-partitions) defines `small maxcpu=192` as the sum across one user's jobs, not the total CPU capacity for all users in the partition. For example, using 72 CPUs and requesting another 128 exceeds that cap (200 > 192), so a job may wait with `QOSMaxCpuPerUserLimit` despite idle CPUs in the shared node pool.
+
+The details' shared node pool comes from `sinfo %C`. It may include allocations by jobs submitted to other partitions. Partitions sharing nodes do not have independent capacities, so their pool totals must not be added together. A CPU is Slurm's configured core/thread scheduling unit, not live CPU utilization. Terminal columns distinguish `JOB_CPUS` (partition jobs), `MY_CPU/CAP` (your usage / partition QoS cap), and `POOL A/T` (shared pool allocated / total).
+
+Cards show three key metrics with more spacing. Click a card for the shared pool pie chart, full CPU/node counts, and global/personal job counts. `My Pending Reasons` groups the current query's pending jobs by `squeue %R`, such as `Priority` or `Dependency`. Unallocated CPUs can be constrained by fragmentation, memory, reservations, time limits, QoS, priority, or dependencies. Spare totals alone cannot establish whether a job can start.
 
 CPU-allocation colors:
 
 - Yellow: allocated CPUs
-- Blue: unallocated CPUs
+- Blue: other unallocated CPUs (not guaranteed schedulable)
+- Purple: idle CPUs on reserved nodes, a subset of total idle CPUs
 - Red: other CPUs
 - Gray background: no CPU capacity or unavailable counts
 
@@ -143,7 +148,7 @@ python slurm_tracker.py --web --ssh-host login-node.example.edu --ssh-user your_
 
 SSH uses `BatchMode=yes` by default, which is best for key-based login. If key-based login is not set up yet, configure it first in your terminal. Avoid relying on interactive password prompts while the Web UI is polling.
 
-In SSH mode, each refresh uses one SSH connection and runs `squeue`, `sacct`, and `sinfo` together on the login node. If the login node still occasionally reports `Connection closed`, increase the refresh interval:
+In SSH mode, each refresh uses one SSH connection for job, node, and QoS queries (`squeue`, `sacct`, `sinfo`, `scontrol`, and `sacctmgr`). If the login node still occasionally reports `Connection closed`, increase the refresh interval:
 
 ```powershell
 python slurm_tracker.py --web --port 0 --interval 30 --ssh-host sycamore.unc.edu --ssh-user lsr --user lsr

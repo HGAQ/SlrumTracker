@@ -9,6 +9,7 @@ import getpass
 import json
 import os
 import platform
+import re
 import shlex
 import shutil
 import signal
@@ -144,6 +145,12 @@ class PartitionSummary:
     cpus_idle: int = 0
     cpus_other: int = 0
     cpus_available: bool = False
+    cpus_reserved_idle: int = 0
+    job_cpus_allocated: Optional[int] = None
+    user_cpus_allocated: Optional[int] = None
+    partition_qos: str = ""
+    qos_user_cpu_limit: Optional[int] = None
+    qos_user_cpus_allocated: Optional[int] = None
     jobs_queued: int = 0
     jobs_running: int = 0
     jobs_other: int = 0
@@ -161,6 +168,14 @@ class PartitionSummary:
         if not self.cpus_available:
             return "-"
         return f"{self.cpus_allocated}/{self.cpus_total}"
+
+    @property
+    def user_cpu_load_text(self) -> str:
+        if self.qos_user_cpu_limit is not None:
+            if self.qos_user_cpus_allocated is None:
+                return "-"
+            return f"{self.qos_user_cpus_allocated}/{self.qos_user_cpu_limit}"
+        return str(self.user_cpus_allocated) if self.user_cpus_allocated is not None else "-"
 
 
 def clean_state(state: str) -> str:
@@ -417,7 +432,7 @@ def split_row(line: str, expected_fields: int) -> Optional[List[str]]:
 
 def build_squeue_jobs_args(user: str, job_ids: Sequence[str]) -> List[str]:
     fmt = DELIM.join(["%i", "%T", "%j", "%P", "%M", "%l", "%D", "%R"])
-    args = ["squeue", "-h", "-o", fmt]
+    args = ["squeue", "-h", "--array", "-o", fmt]
     if user:
         args.extend(["--user", user])
     if job_ids:
@@ -623,6 +638,8 @@ def parse_sinfo_partitions_output(
         summary.cpus_idle += cpus_idle
         summary.cpus_other += cpus_other
         summary.cpus_total += cpus_total
+        if "resv" in node_state.lower() or "reserved" in node_state.lower():
+            summary.cpus_reserved_idle += cpus_idle
         summary.cpus_available = True
 
     for partition in invalid_cpu_partitions:
@@ -644,12 +661,13 @@ def load_sinfo_partitions(
 
 
 def build_partition_queue_counts_args() -> List[str]:
-    fmt = DELIM.join(["%P", "%T"])
-    return ["squeue", "-h", "-o", fmt]
+    fmt = DELIM.join(["%P", "%T", "%C", "%u"])
+    # Expand pending arrays so each element counts as a job.
+    return ["squeue", "-h", "--array", "-o", fmt]
 
 
 def parse_partition_queue_counts_output(
-    output: str,
+    output: str, user: str = "",
 ) -> Tuple[Dict[str, Dict[str, int]], List[str]]:
     warnings: List[str] = []
     counts: Dict[str, Dict[str, int]] = {}
@@ -657,35 +675,84 @@ def parse_partition_queue_counts_output(
     for line in output.splitlines():
         if not line.strip():
             continue
-        fields = split_row(line, 2)
+        fields = split_row(line, 4)
         if fields is None:
             if DELIM in line:
                 warnings.append(f"could not parse partition squeue row: {line!r}")
             continue
-        partition, state = fields
+        partition_list, state, cpu_text, job_user = fields
+        try:
+            job_cpu_count = int(cpu_text)
+            if job_cpu_count < 0:
+                raise ValueError("negative job CPU count")
+        except ValueError:
+            warnings.append(f"could not parse squeue CPU count: {cpu_text!r}")
+            continue
         category = category_for_state(state)
-        bucket = counts.setdefault(
-            normalize_partition(partition),
-            {"queued": 0, "running": 0, "other": 0},
-        )
-        if category == "queued":
-            bucket["queued"] += 1
-        elif category == "running":
-            bucket["running"] += 1
-        else:
-            bucket["other"] += 1
+        for partition in set(partition_list.split(",")):
+            partition_counts = counts.setdefault(
+                normalize_partition(partition),
+                {"queued": 0, "running": 0, "other": 0,
+                 "allocated_cpus": 0, "user_allocated_cpus": 0},
+            )
+            if category == "queued":
+                partition_counts["queued"] += 1
+            elif category == "running":
+                partition_counts["running"] += 1
+                # Suspended jobs retain memory but can release their CPUs.
+                if clean_state(state) != "SUSPENDED":
+                    partition_counts["allocated_cpus"] += job_cpu_count
+                    if job_user == user:
+                        partition_counts["user_allocated_cpus"] += job_cpu_count
+            else:
+                partition_counts["other"] += 1
 
     return counts, warnings
 
 
 def load_partition_queue_counts(
-    runner: CommandRunner,
-) -> Tuple[Dict[str, Dict[str, int]], List[str]]:
+    runner: CommandRunner, user: str = "",
+) -> Tuple[Optional[Dict[str, Dict[str, int]]], List[str]]:
     output, error = run_command(build_partition_queue_counts_args(), runner)
-    counts, warnings = parse_partition_queue_counts_output(output)
+    counts, warnings = parse_partition_queue_counts_output(output, user)
     if error:
         warnings.insert(0, error)
-    return counts, warnings
+    return (None if warnings else counts), warnings
+
+
+def build_partition_policies_args() -> List[str]:
+    return ["scontrol", "show", "partition", "-o"]
+
+
+def build_qos_cpu_limits_args() -> List[str]:
+    return ["sacctmgr", "-n", "-P", "show", "qos", "format=Name,MaxTRESPU"]
+
+
+def parse_partition_cpu_policies(
+    partition_output: str, qos_output: str,
+) -> Dict[str, Tuple[str, Optional[int]]]:
+    """Read partition QoS, not job %q (which may simply be 'normal')."""
+    qos_cpu_limits: Dict[str, int] = {}
+    for qos_line in qos_output.splitlines():
+        qos_fields = qos_line.split("|")
+        if len(qos_fields) < 2:
+            continue
+        for qos_tres in qos_fields[1].split(","):
+            qos_cpu_match = re.fullmatch(r"cpu=(\d+)", qos_tres.strip())
+            if qos_cpu_match:
+                qos_cpu_limits[qos_fields[0].strip()] = int(qos_cpu_match.group(1))
+    partition_policies: Dict[str, Tuple[str, Optional[int]]] = {}
+    for partition_line in partition_output.splitlines():
+        partition_fields = dict(re.findall(r"(\w+)=(\S+)", partition_line))
+        partition_name = partition_fields.get("PartitionName")
+        if partition_name:
+            partition_qos = clean_optional(partition_fields.get("QoS", ""))
+            if partition_qos == "N/A" or partition_qos == "(null)":
+                partition_qos = ""
+            partition_policies[partition_name] = (
+                partition_qos, qos_cpu_limits.get(partition_qos),
+            )
+    return partition_policies
 
 
 def init_db(path: str) -> sqlite3.Connection:
@@ -922,19 +989,27 @@ def partition_sort_key(summary: PartitionSummary) -> Tuple[int, int, int, str]:
 def load_partition_summaries(
     runner: CommandRunner,
     active_user_jobs: Dict[str, Job],
+    user: str = "",
 ) -> Tuple[List[PartitionSummary], List[str]]:
     partitions, warnings = load_sinfo_partitions(runner)
-    queue_counts, queue_warnings = load_partition_queue_counts(runner)
+    queue_counts, queue_warnings = load_partition_queue_counts(runner, user)
     warnings.extend(queue_warnings)
-    return combine_partition_summaries(partitions, queue_counts, active_user_jobs), warnings
+    partition_output, partition_error = run_command(build_partition_policies_args(), runner)
+    qos_output, qos_error = run_command(build_qos_cpu_limits_args(), runner)
+    warnings.extend(policy_error for policy_error in (partition_error, qos_error) if policy_error)
+    partition_policies = parse_partition_cpu_policies(partition_output, qos_output)
+    return combine_partition_summaries(
+        partitions, queue_counts, active_user_jobs, partition_policies,
+    ), warnings
 
 
 def combine_partition_summaries(
     partitions: Dict[str, PartitionSummary],
-    queue_counts: Dict[str, Dict[str, int]],
+    queue_counts: Optional[Dict[str, Dict[str, int]]],
     active_user_jobs: Dict[str, Job],
+    partition_policies: Optional[Dict[str, Tuple[str, Optional[int]]]] = None,
 ) -> List[PartitionSummary]:
-    for partition, counts in queue_counts.items():
+    for partition, counts in (queue_counts or {}).items():
         summary = partitions.setdefault(
             partition,
             PartitionSummary(partition=partition),
@@ -944,18 +1019,34 @@ def combine_partition_summaries(
         summary.jobs_other = counts.get("other", 0)
 
     for job in active_user_jobs.values():
-        summary = partitions.setdefault(
-            normalize_partition(job.partition),
-            PartitionSummary(partition=normalize_partition(job.partition)),
+        for partition in set(job.partition.split(",")):
+            partition = normalize_partition(partition)
+            summary = partitions.setdefault(partition, PartitionSummary(partition=partition))
+            if job.category == "queued":
+                summary.user_queued += 1
+                pending_reason = job.reason.strip().strip("()") or "Unknown"
+                summary.user_pending_reasons[pending_reason] = (
+                    summary.user_pending_reasons.get(pending_reason, 0) + 1
+                )
+            elif job.category == "running":
+                summary.user_running += 1
+
+    partition_policies = partition_policies or {}
+    qos_user_cpu_counts: Dict[str, int] = {}
+    for partition, summary in partitions.items():
+        summary.partition_qos, summary.qos_user_cpu_limit = partition_policies.get(
+            partition, ("", None),
         )
-        if job.category == "queued":
-            summary.user_queued += 1
-            pending_reason = job.reason.strip().strip("()") or "Unknown"
-            summary.user_pending_reasons[pending_reason] = (
-                summary.user_pending_reasons.get(pending_reason, 0) + 1
+        if queue_counts is not None:
+            partition_counts = queue_counts.get(partition, {})
+            summary.job_cpus_allocated = partition_counts.get("allocated_cpus", 0)
+            summary.user_cpus_allocated = partition_counts.get("user_allocated_cpus", 0)
+            qos_user_cpu_counts[summary.partition_qos] = (
+                qos_user_cpu_counts.get(summary.partition_qos, 0) + summary.user_cpus_allocated
             )
-        elif job.category == "running":
-            summary.user_running += 1
+    for summary in partitions.values():
+        if summary.partition_qos and queue_counts is not None:
+            summary.qos_user_cpus_allocated = qos_user_cpu_counts.get(summary.partition_qos, 0)
 
     partition_summaries = list(partitions.values())
     partition_summaries.sort(key=partition_sort_key)
@@ -976,6 +1067,8 @@ def poll_jobs_ssh_batch(
         ("active_jobs", build_squeue_jobs_args(user, job_ids)),
         ("sinfo", build_sinfo_partitions_args()),
         ("partition_queue", build_partition_queue_counts_args()),
+        ("partition_policies", build_partition_policies_args()),
+        ("qos_limits", build_qos_cpu_limits_args()),
     ]
     if not no_sacct:
         commands.insert(1, ("accounted_jobs", build_sacct_jobs_args(user, job_ids, since)))
@@ -995,13 +1088,21 @@ def poll_jobs_ssh_batch(
     partitions, sinfo_warnings = parse_sinfo_partitions_output(outputs.get("sinfo", ""))
     warnings.extend(sinfo_warnings)
     queue_counts, queue_warnings = parse_partition_queue_counts_output(
-        outputs.get("partition_queue", "")
+        outputs.get("partition_queue", ""), user,
     )
     warnings.extend(queue_warnings)
 
     current = combine_jobs(active, accounted)
     record_jobs(conn, current.values())
-    partition_summaries = combine_partition_summaries(partitions, queue_counts, active)
+    if (queue_warnings or "partition_queue" not in outputs
+            or any("squeue failed" in warning or "batch failed" in warning for warning in warnings)):
+        queue_counts = None
+    partition_policies = parse_partition_cpu_policies(
+        outputs.get("partition_policies", ""), outputs.get("qos_limits", ""),
+    )
+    partition_summaries = combine_partition_summaries(
+        partitions, queue_counts, active, partition_policies,
+    )
     return choose_display_jobs(conn, active, limit), partition_summaries, warnings
 
 
@@ -1034,7 +1135,7 @@ def poll_jobs(
 
     current = combine_jobs(active, accounted)
     record_jobs(conn, current.values())
-    partitions, partition_warnings = load_partition_summaries(runner, active)
+    partitions, partition_warnings = load_partition_summaries(runner, active, user)
     warnings.extend(partition_warnings)
     return choose_display_jobs(conn, active, limit), partitions, warnings
 
@@ -1144,8 +1245,15 @@ def partition_to_dict(summary: PartitionSummary) -> Dict[str, object]:
         "cpus_allocated": summary.cpus_allocated if summary.cpus_available else None,
         "cpus_idle": summary.cpus_idle if summary.cpus_available else None,
         "cpus_other": summary.cpus_other if summary.cpus_available else None,
+        "cpus_reserved_idle": summary.cpus_reserved_idle if summary.cpus_available else None,
         "cpus_available": summary.cpus_available,
         "cpu_load_text": summary.cpu_load_text,
+        "job_cpus_allocated": summary.job_cpus_allocated,
+        "user_cpus_allocated": summary.user_cpus_allocated,
+        "partition_qos": summary.partition_qos,
+        "qos_user_cpu_limit": summary.qos_user_cpu_limit,
+        "qos_user_cpus_allocated": summary.qos_user_cpus_allocated,
+        "user_cpu_load_text": summary.user_cpu_load_text,
         "jobs_queued": summary.jobs_queued,
         "jobs_running": summary.jobs_running,
         "jobs_other": summary.jobs_other,
@@ -1205,8 +1313,8 @@ def render(
         print("Partitions:")
         print(
             f"{'PARTITION':<14} {'AVAIL':<7} {'QUEUED':>6} {'RUN':>5} "
-            f"{'MINE_Q':>6} {'MINE_R':>6} {'CPUS A/T':>13} "
-            f"{'UNALLOC':>7} {'OTHER':>7} {'LIMIT':>10}"
+            f"{'MINE_Q':>6} {'MINE_R':>6} {'JOB_CPUS':>9} "
+            f"{'MY_CPU/CAP':>12} {'POOL A/T':>13} {'LIMIT':>10}"
         )
         print("-" * min(width, 100))
         for part in partitions[:20]:
@@ -1217,9 +1325,9 @@ def render(
                 f"{part.jobs_running:>5} "
                 f"{part.user_queued:>6} "
                 f"{part.user_running:>6} "
+                f"{str(part.job_cpus_allocated) if part.job_cpus_allocated is not None else '-':>9} "
+                f"{part.user_cpu_load_text:>12} "
                 f"{part.cpu_load_text:>13} "
-                f"{str(part.cpus_idle) if part.cpus_available else '-':>7} "
-                f"{str(part.cpus_other) if part.cpus_available else '-':>7} "
                 f"{truncate(part.max_time, 10):>10}"
             )
             if part.user_pending_reasons:
@@ -1277,6 +1385,7 @@ WEB_HTML = r"""<!doctype html>
   --cpu-red: #d94b4b;
   --cpu-yellow: #f2c94c;
   --cpu-unallocated: #3b82d6;
+  --cpu-reserved: #8b5cf6;
   --cpu-gray: #9aa4b2;
 }
 * { box-sizing: border-box; }
@@ -1448,16 +1557,6 @@ h1 {
   font-size: 20px;
   font-weight: 600;
   font-variant-numeric: tabular-nums;
-}
-.partition-cpu-bar {
-  display: flex;
-  height: 6px;
-  border-radius: 3px;
-  overflow: hidden;
-  background: var(--cpu-gray);
-}
-.partition-cpu-bar span {
-  height: 100%;
 }
 .partition-note {
   color: var(--muted);
@@ -1652,7 +1751,7 @@ h1 {
 </header>
 <main class="wrap">
   <div class="status-line" id="status">Loading Slurm data...</div>
-  <p class="partition-note">Unallocated CPUs are not guaranteed available to your jobs. Partitions may share nodes. Select a partition for your pending reasons.</p>
+  <p class="partition-note">Job CPUs are counted by submitted partition. My CPU cap comes from partition QoS; shared node capacity is shown in details.</p>
   <section class="partition-strip" id="partitions" aria-label="Partitions"></section>
   <section class="light-grid" id="lights" aria-label="Slurm jobs"></section>
 </main>
@@ -1666,7 +1765,7 @@ h1 {
     <button class="close" id="close" type="button" aria-label="Close">&times;</button>
   </div>
   <section class="cpu-chart-section" id="cpu-chart" hidden>
-    <div class="cpu-pie" id="cpu-pie" aria-label="CPU allocation pie chart">
+    <div class="cpu-pie" id="cpu-pie" aria-label="Shared node pool CPU allocation">
       <span class="cpu-pie-total" id="cpu-pie-total"></span>
     </div>
     <div class="cpu-legend" id="cpu-legend"></div>
@@ -1714,7 +1813,8 @@ function cpuSlices(partition) {
   if (!partition.cpus_available) return [];
   return [
     ["Allocated CPUs", Number(partition.cpus_allocated), "var(--cpu-yellow)"],
-    ["Unallocated CPUs", Number(partition.cpus_idle), "var(--cpu-unallocated)"],
+    ["Other unallocated CPUs", Number(partition.cpus_idle) - Number(partition.cpus_reserved_idle || 0), "var(--cpu-unallocated)"],
+    ["Idle on reserved nodes", Number(partition.cpus_reserved_idle || 0), "var(--cpu-reserved)"],
     ["Other CPUs", Number(partition.cpus_other), "var(--cpu-red)"],
   ];
 }
@@ -1801,7 +1901,7 @@ function openPartitionDetail(partition) {
   selectedPartitionName = partition.partition;
   const downTotal = Number(partition.nodes_down || 0) + Number(partition.nodes_draining || 0);
   detailTitle.textContent = partition.partition;
-  detailSubtitle.textContent = `Availability ${text(partition.availability)} · Slurm CPU allocation (cores or hardware threads)`;
+  detailSubtitle.textContent = `Partition QoS: ${text(partition.partition_qos)} · Chart: shared node pool, including jobs from other partitions`;
   renderCpuChart(partition);
   const pendingReasonEntries = Object.entries(partition.user_pending_reasons || {})
     .sort((firstReason, secondReason) => secondReason[1] - firstReason[1]);
@@ -1811,13 +1911,18 @@ function openPartitionDetail(partition) {
   const partitionFields = [
     ["Availability", partition.availability],
     ["Max Time", partition.max_time],
-    ["CPUs Allocated / Total", partition.cpu_load_text],
-    ["CPUs Total", partition.cpus_total],
-    ["CPUs Allocated", partition.cpus_allocated],
-    ["CPUs Unallocated", partition.cpus_idle],
-    ["CPUs Other", partition.cpus_other],
+    ["Partition Job CPUs", partition.job_cpus_allocated],
+    ["My CPUs in Partition", partition.user_cpus_allocated],
+    ["Partition QoS", partition.partition_qos],
+    ["My CPUs under This QoS", partition.qos_user_cpus_allocated],
+    ["QoS CPU Cap per User", partition.qos_user_cpu_limit],
     ["My Pending Reasons", pendingReasonText],
-    ["Scheduling", "Unallocated CPUs may be fragmented or reserved. Memory, time limits, priority, QoS and dependencies can prevent a job from starting."],
+    ["QoS Scope", "The CPU cap is per user across partitions with the same partition QoS. Job QoS or account limits may impose additional constraints."],
+    ["Shared Pool Used / Total", partition.cpu_load_text],
+    ["Shared Pool Unallocated", partition.cpus_idle],
+    ["Idle on Reserved Nodes", partition.cpus_reserved_idle],
+    ["Shared Pool Other", partition.cpus_other],
+    ["Scheduling", "The shared pool is not exclusive to this partition. Unallocated CPUs may be reserved or fragmented; memory, priority, QoS and dependencies can prevent a job from starting."],
     ["Queue Jobs", partition.jobs_queued],
     ["Running Jobs", partition.jobs_running],
     ["Other Jobs", partition.jobs_other],
@@ -1875,22 +1980,17 @@ function renderPartitions(partitionPayload) {
     const isUp = String(partition.availability || "").toLowerCase() === "up";
     item.title = `${partition.partition} availability ${partition.availability}`;
     item.setAttribute("aria-label", item.title);
-    const partitionCpuSlices = cpuSlices(partition);
-    const cpuTotal = partitionCpuSlices.reduce((sum, [, value]) => sum + value, 0);
     item.innerHTML = `
       <div class="partition-head">
         <div class="partition-name" title="${escapeHtml(partition.partition)}">${escapeHtml(partition.partition)}</div>
         <div class="partition-avail" data-up="${isUp}" title="Partition state, not a guarantee that your job can start">State ${escapeHtml(partition.availability)}</div>
       </div>
       <div class="partition-body">
-        <div class="partition-cpu-load" title="Allocated / total Slurm CPUs (cores or hardware threads)">
-          <span>Allocated CPUs</span><strong>${escapeHtml(partition.cpu_load_text)}</strong>
-        </div>
-        <div class="partition-cpu-bar" aria-label="CPU allocation: allocated, unallocated, other">
-          ${partitionCpuSlices.map(([, cpuCount, cpuColor]) => `<span style="width: ${percent(cpuCount, cpuTotal)}; background: ${cpuColor}"></span>`).join("")}
+        <div class="partition-cpu-load" title="CPUs assigned to active jobs submitted to this partition, from squeue">
+          <span>Partition job CPUs</span><strong>${escapeHtml(partition.job_cpus_allocated)}</strong>
         </div>
         <div class="partition-metrics">
-          <div title="Slurm idle CPUs; not necessarily schedulable for your jobs"><span class="metric-label">Unallocated</span><span class="metric-value">${escapeHtml(partition.cpus_idle)}</span></div>
+          <div title="My CPU allocation across partitions sharing this partition QoS; without a reported cap, shows my CPUs in this partition"><span class="metric-label">${partition.qos_user_cpu_limit == null ? "My CPUs" : "My CPUs / QoS cap"}</span><span class="metric-value">${escapeHtml(partition.user_cpu_load_text)}</span></div>
           <div title="Open details to see the pending reasons from Slurm"><span class="metric-label">My queued</span><span class="metric-value">${escapeHtml(partition.user_queued)}</span></div>
         </div>
       </div>`;

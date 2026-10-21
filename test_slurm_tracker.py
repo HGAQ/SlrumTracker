@@ -95,14 +95,17 @@ class PartitionCpuTests(unittest.TestCase):
         with contextlib.redirect_stdout(terminal_output):
             tracker.render([], list(partition_summaries.values()), parse_warnings,
                            ":memory:", "test", 10, False, False)
-        self.assertIn("CPUS A/T", terminal_output.getvalue())
+        self.assertIn("JOB_CPUS", terminal_output.getvalue())
+        self.assertIn("POOL A/T", terminal_output.getvalue())
         self.assertIn("8/32", terminal_output.getvalue())
 
     def test_ssh_batch_uses_same_cpu_parser(self):
         with tracker.init_db(":memory:") as tracker_database:
             with patch.object(tracker, "run_ssh_batch", return_value=({
-                "squeue": "", "sinfo": sinfo_row("compute", 1, "mixed", "8/24/0/32"),
-                "partition_queue": "",
+                "active_jobs": "", "sinfo": sinfo_row("compute", 1, "mixed", "8/24/0/32"),
+                "partition_queue": tracker.DELIM.join(["compute", "RUNNING", "8", "test_user"]),
+                "partition_policies": "PartitionName=compute QoS=small",
+                "qos_limits": "small|cpu=192",
             }, [])) as ssh_batch:
                 displayed_jobs, partition_summaries, parse_warnings = tracker.poll_jobs_ssh_batch(
                     tracker_database, tracker.CommandRunner(backend="ssh"),
@@ -111,6 +114,8 @@ class PartitionCpuTests(unittest.TestCase):
         self.assertEqual(displayed_jobs, [])
         self.assertEqual(parse_warnings, [])
         self.assertEqual(partition_summaries[0].cpu_load_text, "8/32")
+        self.assertEqual(partition_summaries[0].job_cpus_allocated, 8)
+        self.assertEqual(partition_summaries[0].user_cpu_load_text, "8/192")
         ssh_commands = dict(ssh_batch.call_args.args[1])
         self.assertIn("%C", ssh_commands["sinfo"][-1])
 
@@ -144,6 +149,75 @@ class PartitionCpuTests(unittest.TestCase):
         self.assertEqual(parse_warnings, [])
         self.assertEqual(partition_summaries["small"].cpus_idle, 32)
         self.assertEqual(partition_summaries["batch"].cpus_idle, 32)
+
+    def test_queue_counts_distinguish_allocations_from_pending_requests(self):
+        queue_rows = [
+            ["small", "RUNNING", "64", "test_user"],
+            ["small", "RUNNING", "8", "test_user"],
+            ["small", "RUNNING", "96", "another_user"],
+            ["small", "PENDING", "128", "test_user"],
+            ["small", "SUSPENDED", "32", "another_user"],
+            ["batch,lowpri", "PENDING", "48", "another_user"],
+        ]
+        queue_counts, parse_warnings = tracker.parse_partition_queue_counts_output(
+            "\n".join(tracker.DELIM.join(queue_row) for queue_row in queue_rows), "test_user",
+        )
+        self.assertEqual(parse_warnings, [])
+        self.assertEqual(queue_counts["small"]["allocated_cpus"], 168)
+        self.assertEqual(queue_counts["small"]["user_allocated_cpus"], 72)
+        self.assertEqual(queue_counts["small"]["queued"], 1)
+        self.assertEqual(queue_counts["batch"]["queued"], 1)
+        self.assertEqual(queue_counts["lowpri"]["queued"], 1)
+
+    def test_partition_qos_caps_and_shared_qos_usage(self):
+        partition_policies = tracker.parse_partition_cpu_policies(
+            "PartitionName=small QoS=small\nPartitionName=batch QoS=batch\n"
+            "PartitionName=lowpri QoS=batch\nPartitionName=uncapped QoS=debug",
+            "small|cpu=192\nbatch|cpu=5000,mem=1T\ndebug|\n",
+        )
+        queue_counts = {
+            "small": {"allocated_cpus": 1061, "user_allocated_cpus": 72},
+            "batch": {"allocated_cpus": 1000, "user_allocated_cpus": 48},
+            "lowpri": {"allocated_cpus": 96, "user_allocated_cpus": 96},
+            "uncapped": {"allocated_cpus": 8, "user_allocated_cpus": 8},
+        }
+        partition_summaries = tracker.combine_partition_summaries(
+            {}, queue_counts, {}, partition_policies,
+        )
+        partition_cpu_text = {
+            partition_summary.partition: partition_summary.user_cpu_load_text
+            for partition_summary in partition_summaries
+        }
+        self.assertEqual(partition_cpu_text["small"], "72/192")
+        self.assertEqual(partition_cpu_text["batch"], "144/5000")
+        self.assertEqual(partition_cpu_text["lowpri"], "144/5000")
+        self.assertEqual(partition_cpu_text["uncapped"], "8")
+
+    def test_reserved_node_idle_is_subset_of_shared_pool_idle(self):
+        partition_summaries, parse_warnings = tracker.parse_sinfo_partitions_output("\n".join([
+            sinfo_row("small", 4, "reserved", "0/768/0/768"),
+            sinfo_row("small", 23, "mixed", "3601/815/0/4416"),
+        ]))
+        self.assertEqual(parse_warnings, [])
+        self.assertEqual(partition_summaries["small"].cpus_reserved_idle, 768)
+        self.assertEqual(partition_summaries["small"].cpus_idle, 1583)
+
+    def test_failed_queue_query_does_not_imply_zero_usage(self):
+        for queue_reply in (("", "squeue failed"),
+                            (tracker.DELIM.join(["small", "RUNNING", "bad", "test_user"]), None)):
+            with self.subTest(queue_reply=queue_reply):
+                with patch.object(tracker, "run_command", return_value=queue_reply):
+                    queue_counts, queue_warnings = tracker.load_partition_queue_counts(
+                        tracker.CommandRunner(backend="local"), "test_user",
+                    )
+                self.assertIsNone(queue_counts)
+                self.assertTrue(queue_warnings)
+                partition_summaries = tracker.combine_partition_summaries(
+                    {"small": tracker.PartitionSummary(partition="small")}, queue_counts,
+                    {}, {"small": ("small", 192)},
+                )
+                self.assertIsNone(partition_summaries[0].job_cpus_allocated)
+                self.assertEqual(partition_summaries[0].user_cpu_load_text, "-")
 
 
 if __name__ == "__main__":

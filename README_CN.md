@@ -45,23 +45,28 @@ http://127.0.0.1:8765/
 
 页面上方还会显示各个 partition 的当前状态：
 
-- `Allocated CPUs`：已分配 CPU 数 / 总 CPU 数
-- `Unallocated`：Slurm 报告的未分配（idle）CPU 数，包括 mixed 节点内的余量；不等于你的作业可立即使用的核数
+- `Partition job CPUs`：通过 `squeue` 汇总实际提交到该 partition 的活动作业占用核数，不包括排队请求和已暂停作业
+- `My CPUs / QoS cap`：你在同一 partition QoS 下的占用核数 / 每用户核数上限；多个 partition 共用 QoS 时合并你的占用。查不到上限时显示 `My CPUs`，仅统计该分区
 - `My queued`：本次查询中你的排队任务数
 - `State up`：来自 `sinfo` 的 partition 状态，不保证任务能立即启动
 
-CPU 统计直接读取 `sinfo %C` 的 allocated/idle/other/total，按 partition 汇总；不是用占用节点数乘每节点核数。这里的 CPU 是 Slurm 配置的调度单位，可能是物理核，也可能是硬件线程（超线程），不表示实时 CPU 使用率。多个 partition 可以共用节点，不能将这些 partition 的容量相加当作集群总容量。终端 partition 表也采用 CPU 统计，`CPUS A/T` 表示已分配 / 总数，`UNALLOC` 表示未分配；无法取得完整 CPU 统计时显示 `-`。
+卡片以 `squeue --array` 的逐作业 CPU 分配为准，展开任务数组计数。QoS 名称从 `scontrol show partition -o` 获取，每用户 CPU 上限从 `sacctmgr show qos` 的 `MaxTRESPU` 获取，不硬编码集群上限。作业自身的 QoS 可能是 `normal`，与 partition QoS 不同；其他作业 QoS 或账户限制仍可能生效。查询失败时对应 CPU 数据显示 `-`。
+
+[UNC Sycamore 分区说明](https://help.rc.unc.edu/sycamore-partitions)中的 `small maxcpu=192` 是**每用户所有作业合计**的上限，不是该分区所有用户总共只有 192 核。例如你已占用 72 核，再启动 128 核作业将达到 200 核，可能因 `QOSMaxCpuPerUserLimit` 等待，即使物理池还有 idle CPU。
+
+详情中的共享节点池统计来自 `sinfo %C`；多个 partition 可以共用节点，池中已分配 CPU 也可能属于其他分区的作业。不能将这些 partition 的容量相加当作集群总容量。CPU 是 Slurm 的调度单位（物理核或硬件线程），不表示实时 CPU 使用率。终端的 `JOB_CPUS` 表示该分区作业占用，`MY_CPU/CAP` 表示你的占用/partition QoS 上限，`POOL A/T` 才是物理节点池已分配/总数。
 
 点击任意 partition 摘要会展开 CPU 明细、全局队列数、你的任务数和 `My Pending Reasons`（当前查询返回的等待原因及数量），同时保留 allocated/mixed/down/draining 节点数。等待原因直接来自 `squeue %R`：例如 `Priority` 表示优先级等待，`Dependency` 表示依赖尚未满足。未分配 CPU 可能分散在不同节点或受预留、内存、时限、QoS 等约束；不能仅根据 CPU 总余量判断某个作业能否启动。
 
-partition 详情里会显示 CPU 分配饼图：
+partition 详情里会显示共享节点池的 CPU 分配饼图：
 
 - 黄色：allocated CPU
-- 蓝色：未分配 CPU
+- 蓝色：其他未分配 CPU（仍不保证可调度）
+- 紫色：reserved 状态节点上的未分配 CPU，是总 idle 的子集
 - 红色：other CPU
 - 灰色底图：无 CPU 容量或统计不可用
 
-主页面卡片使用细横条展示 CPU 分配，只保留三个关键数字，增加留白；点击卡片查看饼图、图例和完整明细。
+主页面卡片只保留三个关键数字，增加留白；点击卡片查看饼图、图例和完整明细。
 
 ## 配置文件与直接启动
 
@@ -141,7 +146,7 @@ python slurm_tracker.py --web --ssh-host login-node.example.edu --ssh-user your_
 
 默认 SSH 使用 `BatchMode=yes`，适合已经配置好免密登录的情况。如果还没配置免密，可以先在终端里完成 SSH key 配置；不建议让 Web UI 轮询时等待密码输入。
 
-SSH 模式下，每次刷新只会建立一个 SSH 连接，并在登录节点上一次性执行 `squeue`、`sacct`、`sinfo`。如果登录节点仍然偶尔报 `Connection closed`，可以把刷新间隔调大：
+SSH 模式下，每次刷新只会建立一个 SSH 连接，并在登录节点上执行作业、节点和 QoS 查询（`squeue`、`sacct`、`sinfo`、`scontrol`、`sacctmgr`）。如果登录节点仍然偶尔报 `Connection closed`，可以把刷新间隔调大：
 
 ```powershell
 python slurm_tracker.py --web --port 0 --interval 30 --ssh-host sycamore.unc.edu --ssh-user lsr --user lsr
