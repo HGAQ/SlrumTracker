@@ -146,6 +146,7 @@ class PartitionSummary:
     cpus_other: int = 0
     cpus_available: bool = False
     cpus_reserved_idle: int = 0
+    node_cpu_counts: Dict[str, Optional[Tuple[int, int, int, int, int]]] = field(default_factory=dict)
     job_cpus_allocated: Optional[int] = None
     user_cpus_allocated: Optional[int] = None
     partition_qos: str = ""
@@ -594,9 +595,9 @@ def add_node_state(summary: PartitionSummary, state: str, count: int) -> None:
 
 
 def build_sinfo_partitions_args() -> List[str]:
-    # %T splits states into separate rows; %C already totals CPUs in each row.
-    fmt = DELIM.join(["%P", "%a", "%l", "%D", "%T", "%C"])
-    return ["sinfo", "-h", "-o", fmt]
+    # One row per node/partition lets shared pools deduplicate physical CPUs.
+    fmt = DELIM.join(["%P", "%a", "%l", "%D", "%T", "%C", "%N"])
+    return ["sinfo", "-N", "-h", "-o", fmt]
 
 
 def parse_sinfo_partitions_output(
@@ -609,13 +610,14 @@ def parse_sinfo_partitions_output(
     for line in output.splitlines():
         if not line.strip():
             continue
-        fields = split_row(line, 6)
+        fields = split_row(line, 7) or split_row(line, 6)
         if fields is None:
             if DELIM in line:
                 invalid_cpu_partitions.add(normalize_partition(line.split(DELIM, 1)[0]))
                 warnings.append(f"could not parse sinfo row: {line!r}")
             continue
-        raw_partition, availability, max_time, nodes, node_state, cpu_states = fields
+        raw_partition, availability, max_time, nodes, node_state, cpu_states = fields[:6]
+        node_name = fields[6] if len(fields) == 7 else ""
         partition = normalize_partition(raw_partition)
         summary = partitions.setdefault(partition, PartitionSummary(partition=partition))
         if availability.lower() == "up" or not summary.availability:
@@ -623,6 +625,8 @@ def parse_sinfo_partitions_output(
         if max_time and not summary.max_time:
             summary.max_time = max_time
         add_node_state(summary, node_state, parse_int(nodes))
+        if node_name:
+            summary.node_cpu_counts[node_name] = None
         try:
             cpu_counts = [int(cpu_count) for cpu_count in cpu_states.split("/")]
             if len(cpu_counts) != 4 or any(cpu_count < 0 for cpu_count in cpu_counts):
@@ -638,8 +642,12 @@ def parse_sinfo_partitions_output(
         summary.cpus_idle += cpus_idle
         summary.cpus_other += cpus_other
         summary.cpus_total += cpus_total
-        if "resv" in node_state.lower() or "reserved" in node_state.lower():
-            summary.cpus_reserved_idle += cpus_idle
+        reserved_idle = cpus_idle if "resv" in node_state.lower() or "reserved" in node_state.lower() else 0
+        summary.cpus_reserved_idle += reserved_idle
+        if node_name:
+            summary.node_cpu_counts[node_name] = (
+                cpus_allocated, cpus_idle, cpus_other, cpus_total, reserved_idle,
+            )
         summary.cpus_available = True
 
     for partition in invalid_cpu_partitions:
@@ -1263,6 +1271,71 @@ def partition_to_dict(summary: PartitionSummary) -> Dict[str, object]:
     }
 
 
+def build_partition_pool_summaries(
+    partitions: Sequence[PartitionSummary],
+) -> List[Dict[str, object]]:
+    """Group connected node sets and count each physical node exactly once."""
+    pool_members: List[List[PartitionSummary]] = []
+    for partition in partitions:
+        merged_members = [partition]
+        merged_nodes = set(partition.node_cpu_counts)
+        separate_pools: List[List[PartitionSummary]] = []
+        for existing_members in pool_members:
+            existing_nodes = {
+                node_name for existing_partition in existing_members
+                for node_name in existing_partition.node_cpu_counts
+            }
+            if merged_nodes & existing_nodes:
+                merged_members.extend(existing_members)
+                merged_nodes.update(existing_nodes)
+            else:
+                separate_pools.append(existing_members)
+        separate_pools.append(merged_members)
+        pool_members = separate_pools
+
+    partition_pools: List[Dict[str, object]] = []
+    partition_order = {partition.partition: index for index, partition in enumerate(partitions)}
+    for pool_partitions in pool_members:
+        pool_partitions.sort(key=lambda partition: partition.partition)
+        pool_node_counts: Dict[str, Optional[Tuple[int, int, int, int, int]]] = {}
+        pool_available = all(partition.cpus_available for partition in pool_partitions)
+        for partition in pool_partitions:
+            for node_name, node_counts in partition.node_cpu_counts.items():
+                if node_name in pool_node_counts and pool_node_counts[node_name] != node_counts:
+                    pool_available = False
+                pool_node_counts[node_name] = node_counts
+        pool_cpu_counts = [0, 0, 0, 0, 0]
+        if pool_node_counts:
+            for node_counts in pool_node_counts.values():
+                if node_counts is None:
+                    pool_available = False
+                else:
+                    pool_cpu_counts = [
+                        pool_count + node_count
+                        for pool_count, node_count in zip(pool_cpu_counts, node_counts)
+                    ]
+        else:
+            # Unknown membership remains standalone, even when totals match.
+            partition = pool_partitions[0]
+            pool_cpu_counts = [partition.cpus_allocated, partition.cpus_idle,
+                               partition.cpus_other, partition.cpus_total, partition.cpus_reserved_idle]
+        partition_pools.append({
+            "partitions": [partition.partition for partition in pool_partitions],
+            "nodes_total": len(pool_node_counts) if pool_node_counts else pool_partitions[0].nodes_total,
+            "membership_known": bool(pool_node_counts),
+            "cpus_available": pool_available,
+            **{
+                cpu_name: cpu_count if pool_available else None
+                for cpu_name, cpu_count in zip(
+                    ("cpus_allocated", "cpus_idle", "cpus_other", "cpus_total", "cpus_reserved_idle"),
+                    pool_cpu_counts,
+                )
+            },
+        })
+    partition_pools.sort(key=lambda pool: min(partition_order[name] for name in pool["partitions"]))
+    return partition_pools
+
+
 def terminal_width() -> int:
     return shutil.get_terminal_size((120, 30)).columns
 
@@ -1485,78 +1558,90 @@ h1 {
 }
 .partition-strip {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr));
   gap: 16px;
   margin-bottom: 26px;
 }
-.partition-item {
+.pool-section {
   min-width: 0;
+  padding: 20px;
   border: 1px solid var(--line);
-  border-radius: 8px;
-  background: #ffffff;
-  padding: 18px 20px;
+  border-radius: 10px;
+  background: var(--panel);
+}
+.pool-head {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 8px 20px;
+  margin-bottom: 16px;
+}
+.pool-title {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 650;
+  overflow-wrap: anywhere;
+}
+.pool-capacity {
+  color: var(--muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+.pool-bar {
+  display: flex;
+  height: 20px;
+  overflow: hidden;
+  border-radius: 5px;
+  background: var(--cpu-gray);
+}
+.pool-bar-segment { height: 100%; }
+.pool-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 20px;
+  margin: 12px 0 18px;
+  color: var(--muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+.pool-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.pool-swatch {
+  width: 9px;
+  height: 9px;
+  border-radius: 2px;
+}
+.pool-partitions {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 210px), 1fr));
+  gap: 10px;
+}
+.partition-item {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px 12px;
+  min-width: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
   color: inherit;
+  background: var(--panel);
   cursor: pointer;
   font: inherit;
   text-align: left;
-  width: 100%;
 }
+.partition-item strong { font-size: 13px; overflow-wrap: anywhere; }
+.partition-item span { color: var(--muted); font-size: 12px; }
+.partition-item .partition-personal { flex-basis: 100%; }
 .partition-item:hover,
 .partition-item:focus-visible {
   border-color: #9aa4b2;
   outline: 3px solid rgba(31, 41, 51, 0.12);
   outline-offset: 2px;
-}
-.partition-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  margin-bottom: 18px;
-}
-.partition-name {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: 15px;
-  font-weight: 650;
-}
-.partition-avail {
-  border-radius: 999px;
-  border: 1px solid var(--line);
-  padding: 2px 7px;
-  color: var(--muted);
-  font-size: 11px;
-  line-height: 1.4;
-  white-space: nowrap;
-}
-.partition-avail[data-up="true"] {
-  color: var(--muted);
-}
-.partition-metrics {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 18px;
-}
-.partition-body {
-  display: grid;
-  gap: 16px;
-}
-.partition-cpu-load {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 6px 16px;
-  color: var(--muted);
-  font-size: 12px;
-}
-.partition-cpu-load strong {
-  color: var(--ink);
-  font-size: 20px;
-  font-weight: 600;
-  font-variant-numeric: tabular-nums;
 }
 .partition-note {
   color: var(--muted);
@@ -1751,7 +1836,7 @@ h1 {
 </header>
 <main class="wrap">
   <div class="status-line" id="status">Loading Slurm data...</div>
-  <p class="partition-note">Job CPUs are counted by submitted partition. My CPU cap comes from partition QoS; shared node capacity is shown in details.</p>
+  <p class="partition-note">One bar per shared node pool; independent partitions have their own bar. Unallocated CPUs may still be constrained. Select a partition for your QoS cap and pending reasons.</p>
   <section class="partition-strip" id="partitions" aria-label="Partitions"></section>
   <section class="light-grid" id="lights" aria-label="Slurm jobs"></section>
 </main>
@@ -1971,37 +2056,73 @@ function renderLights(data) {
   }
 }
 
+function poolCpuSlices(pool, poolPartitions) {
+  if (!pool.cpus_available) return [];
+  const partitionColors = ["#d59a27", "#268c85", "#547bc5", "#c56b48", "#9868b3", "#6f8640"];
+  const partitionCpuSum = poolPartitions.reduce((cpuSum, partition) => cpuSum + Number(partition.job_cpus_allocated || 0), 0);
+  const partitionCpuSlices = [];
+  if (poolPartitions.every(partition => partition.job_cpus_allocated != null)
+      && partitionCpuSum <= Number(pool.cpus_allocated)) {
+    poolPartitions.forEach((partition, partitionIndex) => {
+      partitionCpuSlices.push([partition.partition, Number(partition.job_cpus_allocated), partitionColors[partitionIndex % partitionColors.length]]);
+    });
+    partitionCpuSlices.push(["Other allocated", Number(pool.cpus_allocated) - partitionCpuSum, "var(--cpu-yellow)"]);
+  } else {
+    // squeue and sinfo are separate snapshots: never stretch a bar past capacity.
+    partitionCpuSlices.push(["Allocated (pool snapshot)", Number(pool.cpus_allocated), "var(--cpu-yellow)"]);
+  }
+  partitionCpuSlices.push(
+    ["Unallocated", Number(pool.cpus_idle) - Number(pool.cpus_reserved_idle || 0), "var(--cpu-unallocated)"],
+    ["Idle on reserved nodes", Number(pool.cpus_reserved_idle || 0), "var(--cpu-reserved)"],
+    ["Unavailable / other", Number(pool.cpus_other), "var(--cpu-red)"],
+  );
+  return partitionCpuSlices.filter(([, cpuCount]) => cpuCount > 0);
+}
+
 function renderPartitions(partitionPayload) {
   partitions.replaceChildren();
-  (partitionPayload.partitions || []).forEach(partition => {
-    const item = document.createElement("button");
-    item.type = "button";
-    item.className = "partition-item";
-    const isUp = String(partition.availability || "").toLowerCase() === "up";
-    item.title = `${partition.partition} availability ${partition.availability}`;
-    item.setAttribute("aria-label", item.title);
-    item.innerHTML = `
-      <div class="partition-head">
-        <div class="partition-name" title="${escapeHtml(partition.partition)}">${escapeHtml(partition.partition)}</div>
-        <div class="partition-avail" data-up="${isUp}" title="Partition state, not a guarantee that your job can start">State ${escapeHtml(partition.availability)}</div>
+  const partitionLookup = new Map((partitionPayload.partitions || []).map(partition => [partition.partition, partition]));
+  const partitionPools = partitionPayload.partition_pools || (partitionPayload.partitions || []).map(partition => ({...partition, partitions: [partition.partition]}));
+  partitionPools.forEach(pool => {
+    const poolPartitions = pool.partitions.map(partitionName => partitionLookup.get(partitionName)).filter(Boolean);
+    const poolSlices = poolCpuSlices(pool, poolPartitions);
+    const poolTotal = Number(pool.cpus_total || 0);
+    const poolSection = document.createElement("section");
+    poolSection.className = "pool-section";
+    const poolTitle = pool.partitions.join(" / ");
+    const poolBarLabel = pool.cpus_available
+      ? poolSlices.map(([cpuLabel, cpuCount]) => `${cpuLabel}: ${cpuCount}`).join("; ")
+      : "CPU counts unavailable";
+    poolSection.innerHTML = `
+      <div class="pool-head">
+        <h2 class="pool-title">${escapeHtml(poolTitle)}</h2>
+        <span class="pool-capacity">${pool.partitions.length > 1 ? "Shared pool" : (pool.membership_known ? "Independent partition" : "Partition pool")} · ${escapeHtml(pool.nodes_total)} nodes · ${pool.cpus_available ? escapeHtml(poolTotal) : "-"} CPUs</span>
       </div>
-      <div class="partition-body">
-        <div class="partition-cpu-load" title="CPUs assigned to active jobs submitted to this partition, from squeue">
-          <span>Partition job CPUs</span><strong>${escapeHtml(partition.job_cpus_allocated)}</strong>
-        </div>
-        <div class="partition-metrics">
-          <div title="My CPU allocation across partitions sharing this partition QoS; without a reported cap, shows my CPUs in this partition"><span class="metric-label">${partition.qos_user_cpu_limit == null ? "My CPUs" : "My CPUs / QoS cap"}</span><span class="metric-value">${escapeHtml(partition.user_cpu_load_text)}</span></div>
-          <div title="Open details to see the pending reasons from Slurm"><span class="metric-label">My queued</span><span class="metric-value">${escapeHtml(partition.user_queued)}</span></div>
-        </div>
+      <div class="pool-bar" role="img" aria-label="${escapeHtml(poolBarLabel)}">
+        ${poolSlices.map(([cpuLabel, cpuCount, cpuColor]) => `<span class="pool-bar-segment" style="width: ${poolTotal ? cpuCount / poolTotal * 100 : 0}%; background: ${cpuColor}" title="${escapeHtml(cpuLabel)}: ${escapeHtml(cpuCount)} CPUs (${percent(cpuCount, poolTotal)})"></span>`).join("")}
+      </div>
+      <div class="pool-legend">
+        ${poolSlices.map(([cpuLabel, cpuCount, cpuColor]) => `<span class="pool-legend-item"><span class="pool-swatch" style="background: ${cpuColor}"></span>${escapeHtml(cpuLabel)} <strong>${escapeHtml(cpuCount)}</strong></span>`).join("") || (pool.cpus_available ? "No CPU capacity" : "CPU counts unavailable")}
       </div>`;
-    item.addEventListener("click", () => openPartitionDetail(partition));
-    partitions.appendChild(item);
+    const poolButtons = document.createElement("div");
+    poolButtons.className = "pool-partitions";
+    poolPartitions.forEach(partition => {
+      const partitionButton = document.createElement("button");
+      partitionButton.type = "button";
+      partitionButton.className = "partition-item";
+      partitionButton.title = `${partition.partition} · state ${text(partition.availability)} · View QoS and pending reasons`;
+      partitionButton.innerHTML = `
+        <strong>${escapeHtml(partition.partition)}</strong>
+        <span>${escapeHtml(partition.job_cpus_allocated)} job CPUs</span>
+        <span class="partition-personal">${partition.qos_user_cpu_limit == null ? "My CPUs" : "My CPUs / cap"} ${escapeHtml(partition.user_cpu_load_text)} · My queued ${escapeHtml(partition.user_queued)}</span>`;
+      partitionButton.addEventListener("click", () => openPartitionDetail(partition));
+      poolButtons.appendChild(partitionButton);
+    });
+    poolSection.appendChild(poolButtons);
+    partitions.appendChild(poolSection);
   });
-  if (selectedPartitionName) {
-    const selected = (partitionPayload.partitions || []).find(
-      partition => partition.partition === selectedPartitionName
-    );
-    if (selected) openPartitionDetail(selected);
+  if (selectedPartitionName && partitionLookup.has(selectedPartitionName)) {
+    openPartitionDetail(partitionLookup.get(selectedPartitionName));
   }
 }
 
@@ -2157,6 +2278,7 @@ class TrackerRequestHandler(BaseHTTPRequestHandler):
                 "counts": count_jobs(jobs),
                 "warnings": warnings,
                 "partitions": [partition_to_dict(part) for part in partitions],
+                "partition_pools": build_partition_pool_summaries(partitions),
                 "jobs": [job_to_dict(job) for job in jobs],
             }
         )

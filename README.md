@@ -43,12 +43,14 @@ http://127.0.0.1:8765/
 
 The main job view is a grid of status lights. Click a light to open job details.
 
-The top of the page also shows a partition summary:
+The top of the page shows one horizontal allocation bar per shared node pool. Partitions with overlapping nodes are grouped together, including partial overlaps; independent partitions each get their own bar. Membership comes from `sinfo -N`, and each physical node is counted once. Equal capacities or equal QoS names do not imply a shared pool.
+
+Colored segments show each partition's job allocation, other allocations, unallocated CPUs, idle CPUs on reserved nodes, and unavailable capacity. Since `squeue` and `sinfo` are separate snapshots, a temporary excess of job CPU counts falls back to a single pool-allocation segment rather than stretching the bar beyond capacity. Clickable partition buttons below each bar retain:
 
 - `Partition job CPUs`: CPUs assigned to active jobs submitted to this partition, from `squeue`; pending requests and suspended jobs are excluded
 - `My CPUs / QoS cap`: your allocation across partitions sharing the partition QoS / its per-user CPU cap. Without a reported cap, `My CPUs` shows your allocation in this partition
 - `My queued`: your pending jobs in the current query
-- `State up`: the partition state from `sinfo`, not a guarantee that a job can start
+- Partition state is available in the button tooltip and details; `up` does not guarantee that a job can start
 
 Cards use per-job allocations from `squeue --array`, expanding job arrays for counting. Partition QoS is read from `scontrol show partition -o`, and its per-user CPU cap comes from `sacctmgr show qos` (`MaxTRESPU`), without hardcoded cluster limits. A job's own QoS may be `normal` while a partition QoS also applies. Job QoS and account limits can impose additional constraints. Failed CPU queries display as `-`.
 
@@ -56,7 +58,7 @@ The [UNC Sycamore partition guide](https://help.rc.unc.edu/sycamore-partitions) 
 
 The details' shared node pool comes from `sinfo %C`. It may include allocations by jobs submitted to other partitions. Partitions sharing nodes do not have independent capacities, so their pool totals must not be added together. A CPU is Slurm's configured core/thread scheduling unit, not live CPU utilization. Terminal columns distinguish `JOB_CPUS` (partition jobs), `MY_CPU/CAP` (your usage / partition QoS cap), and `POOL A/T` (shared pool allocated / total).
 
-Cards show three key metrics with more spacing. Click a card for the shared pool pie chart, full CPU/node counts, and global/personal job counts. `My Pending Reasons` groups the current query's pending jobs by `squeue %R`, such as `Priority` or `Dependency`. Unallocated CPUs can be constrained by fragmentation, memory, reservations, time limits, QoS, priority, or dependencies. Spare totals alone cannot establish whether a job can start.
+Each group shows shared capacity only once. Click a partition button for its pool pie chart, full CPU/node counts, and global/personal job counts. `My Pending Reasons` groups the current query's pending jobs by `squeue %R`, such as `Priority` or `Dependency`. Unallocated CPUs can be constrained by fragmentation, memory, reservations, time limits, QoS, priority, or dependencies. Spare totals alone cannot establish whether a job can start.
 
 CPU-allocation colors:
 

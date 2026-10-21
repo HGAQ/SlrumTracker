@@ -220,5 +220,51 @@ class PartitionCpuTests(unittest.TestCase):
                 self.assertEqual(partition_summaries[0].user_cpu_load_text, "-")
 
 
+class PartitionPoolTests(unittest.TestCase):
+    def test_shared_pool_union_handles_partial_overlap_and_late_bridge(self):
+        sinfo_rows = [
+            sinfo_row("first", 1, "mixed", "8/24/0/32") + tracker.DELIM + "node1",
+            sinfo_row("first", 1, "mixed", "16/16/0/32") + tracker.DELIM + "node2",
+            sinfo_row("independent", 1, "idle", "0/32/0/32") + tracker.DELIM + "node4",
+            sinfo_row("third", 1, "reserved", "0/32/0/32") + tracker.DELIM + "node3",
+            sinfo_row("bridge", 1, "mixed", "16/16/0/32") + tracker.DELIM + "node2",
+            sinfo_row("bridge", 1, "reserved", "0/32/0/32") + tracker.DELIM + "node3",
+        ]
+        partition_summaries, parse_warnings = tracker.parse_sinfo_partitions_output("\n".join(sinfo_rows))
+        self.assertEqual(parse_warnings, [])
+        partition_pools = tracker.build_partition_pool_summaries(list(partition_summaries.values()))
+        self.assertEqual(len(partition_pools), 2)
+        shared_pool = partition_pools[0]
+        self.assertEqual(set(shared_pool["partitions"]), {"first", "third", "bridge"})
+        self.assertEqual(shared_pool["nodes_total"], 3)
+        self.assertEqual(shared_pool["cpus_total"], 96)
+        self.assertEqual(shared_pool["cpus_allocated"], 24)
+        self.assertEqual(shared_pool["cpus_idle"], 72)
+        self.assertEqual(shared_pool["cpus_reserved_idle"], 32)
+        self.assertEqual(partition_pools[1]["partitions"], ["independent"])
+
+    def test_equal_capacity_without_shared_nodes_does_not_merge(self):
+        partition_summaries, _ = tracker.parse_sinfo_partitions_output("\n".join([
+            sinfo_row("first", 1, "idle", "0/32/0/32") + tracker.DELIM + "node1",
+            sinfo_row("second", 1, "idle", "0/32/0/32") + tracker.DELIM + "node2",
+            sinfo_row("unknown", 1, "idle", "0/32/0/32"),
+        ]))
+        partition_pools = tracker.build_partition_pool_summaries(list(partition_summaries.values()))
+        self.assertEqual(len(partition_pools), 3)
+        self.assertTrue(all(partition_pool["cpus_total"] == 32 for partition_pool in partition_pools))
+
+    def test_incomplete_or_conflicting_node_stats_hide_pool_capacity(self):
+        for shared_cpu_text in ("N/A", "16/16/0/32"):
+            with self.subTest(shared_cpu_text=shared_cpu_text):
+                partition_summaries, _ = tracker.parse_sinfo_partitions_output("\n".join([
+                    sinfo_row("first", 1, "mixed", "8/24/0/32") + tracker.DELIM + "node1",
+                    sinfo_row("second", 1, "mixed", shared_cpu_text) + tracker.DELIM + "node1",
+                ]))
+                partition_pools = tracker.build_partition_pool_summaries(list(partition_summaries.values()))
+                self.assertEqual(len(partition_pools), 1)
+                self.assertFalse(partition_pools[0]["cpus_available"])
+                self.assertIsNone(partition_pools[0]["cpus_total"])
+
+
 if __name__ == "__main__":
     unittest.main()
