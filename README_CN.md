@@ -15,7 +15,7 @@
 python3 slurm_tracker.py
 ```
 
-默认每 10 秒刷新一次，监控当前用户，显示 20 个任务，并在当前目录写入：
+默认每 10 秒刷新一次，监控当前用户，最多显示 200 个任务，并在当前目录写入：
 
 ```text
 slurm_jobs.sqlite3
@@ -45,25 +45,46 @@ http://127.0.0.1:8765/
 
 页面上方还会显示各个 partition 的当前状态：
 
-- `Queue`：该 partition 全局排队任务数
-- `Run`：该 partition 全局运行任务数
-- `Mine`：你的排队 / 运行任务数
-- `Nodes`：已占用或混合节点数 / 总节点数
-- `Idle`：空闲节点数
-- `Down`：down 或 draining 节点数
-- 右上角 `Avail up`：来自 `sinfo` 的 partition availability，表示该 partition 当前可用
+- `Allocated CPUs`：已分配 CPU 数 / 总 CPU 数
+- `Unallocated`：Slurm 报告的未分配（idle）CPU 数，包括 mixed 节点内的余量；不等于你的作业可立即使用的核数
+- `My queued`：本次查询中你的排队任务数
+- `State up`：来自 `sinfo` 的 partition 状态，不保证任务能立即启动
 
-点击任意 partition 摘要会展开详细信息，包括 allocated/mixed/down/draining 节点数、全局队列数和你的任务数。
+CPU 统计直接读取 `sinfo %C` 的 allocated/idle/other/total，按 partition 汇总；不是用占用节点数乘每节点核数。这里的 CPU 是 Slurm 配置的调度单位，可能是物理核，也可能是硬件线程（超线程），不表示实时 CPU 使用率。多个 partition 可以共用节点，不能将这些 partition 的容量相加当作集群总容量。终端 partition 表也采用 CPU 统计，`CPUS A/T` 表示已分配 / 总数，`UNALLOC` 表示未分配；无法取得完整 CPU 统计时显示 `-`。
 
-partition 详情里会显示节点状态饼图：
+点击任意 partition 摘要会展开 CPU 明细、全局队列数、你的任务数和 `My Pending Reasons`（当前查询返回的等待原因及数量），同时保留 allocated/mixed/down/draining 节点数。等待原因直接来自 `squeue %R`：例如 `Priority` 表示优先级等待，`Dependency` 表示依赖尚未满足。未分配 CPU 可能分散在不同节点或受预留、内存、时限、QoS 等约束；不能仅根据 CPU 总余量判断某个作业能否启动。
 
-- 红色：down 和 draining
-- 黄色：allocated
-- 蓝色：mixed
-- 绿色：idle
-- 灰色：other
+partition 详情里会显示 CPU 分配饼图：
 
-主页面的每个 partition 摘要卡片也会直接显示一个小饼图；点击卡片后会看到更大的饼图、右侧 legend 和完整明细。
+- 黄色：allocated CPU
+- 蓝色：未分配 CPU
+- 红色：other CPU
+- 灰色底图：无 CPU 容量或统计不可用
+
+主页面卡片使用细横条展示 CPU 分配，只保留三个关键数字，增加留白；点击卡片查看饼图、图例和完整明细。
+
+## 配置文件与直接启动
+
+脚本自动读取同目录的 `key.txt`，内容为 `key = value` 格式的启动配置：
+
+```ini
+web = true
+port = 0
+ssh_host = sycamore.unc.edu
+ssh_user = lsr
+user = lsr
+limit = 200
+interval = 10
+ssh_key =
+```
+
+直接运行 `python slurm_tracker.py` 即相当于原来的 `python slurm_tracker.py --web --port 0 --ssh-host sycamore.unc.edu --ssh-user lsr --user lsr`。Windows 安装 Python 并关联 `.py` 后，也可双击启动并自动打开浏览器；需要 Windows OpenSSH。
+
+`key.txt` 存放配置，不存放私钥内容。`ssh_key` 留空时沿用 SSH 默认密钥或 agent；如需指定私钥，在这一项填写私钥文件路径。配置中的相对路径以脚本目录为基准。首次连接前通过终端 SSH 确认主机指纹，加密私钥需预先加载到 SSH agent。
+
+配置文件覆盖环境变量和内置默认值，命令行参数优先级最高。`--terminal` 切回终端模式，`--once` 仅查询一次。Windows 数据库默认保存在脚本同目录。
+
+默认最多 200 个任务，每行 20 个，满 200 个时为 10 行；窄窗口横向滚动。排队和运行任务优先，其余显示最近结束的任务。历史来自本地数据库和默认最近 7 天的 `sacct`，可通过 `--since-days 30` 扩大范围。
 
 ## Windows 远程查询登录节点
 
@@ -119,6 +140,12 @@ python slurm_tracker.py --web --ssh-host login-node.example.edu --ssh-user your_
 ```
 
 默认 SSH 使用 `BatchMode=yes`，适合已经配置好免密登录的情况。如果还没配置免密，可以先在终端里完成 SSH key 配置；不建议让 Web UI 轮询时等待密码输入。
+
+SSH 模式下，每次刷新只会建立一个 SSH 连接，并在登录节点上一次性执行 `squeue`、`sacct`、`sinfo`。如果登录节点仍然偶尔报 `Connection closed`，可以把刷新间隔调大：
+
+```powershell
+python slurm_tracker.py --web --port 0 --interval 30 --ssh-host sycamore.unc.edu --ssh-user lsr --user lsr
+```
 
 只试跑一次并记录本地数据库：
 

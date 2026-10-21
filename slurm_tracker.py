@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import configparser
 import getpass
 import json
 import os
@@ -16,7 +17,9 @@ import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass
+import webbrowser
+from pathlib import Path
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -24,6 +27,7 @@ from urllib.parse import parse_qs, urlparse
 
 
 DELIM = "\x1f"
+SECTION_MARKER = "__SLURM_TRACKER_SECTION__"
 
 RUNNING_STATES = {
     "RUNNING",
@@ -135,16 +139,28 @@ class PartitionSummary:
     nodes_down: int = 0
     nodes_draining: int = 0
     nodes_other: int = 0
+    cpus_total: int = 0
+    cpus_allocated: int = 0
+    cpus_idle: int = 0
+    cpus_other: int = 0
+    cpus_available: bool = False
     jobs_queued: int = 0
     jobs_running: int = 0
     jobs_other: int = 0
     user_queued: int = 0
     user_running: int = 0
+    user_pending_reasons: Dict[str, int] = field(default_factory=dict)
 
     @property
     def load_text(self) -> str:
         active = self.nodes_allocated + self.nodes_mixed
         return f"{active}/{self.nodes_total}" if self.nodes_total else "-"
+
+    @property
+    def cpu_load_text(self) -> str:
+        if not self.cpus_available:
+            return "-"
+        return f"{self.cpus_allocated}/{self.cpus_total}"
 
 
 def clean_state(state: str) -> str:
@@ -228,7 +244,18 @@ def build_ssh_args(runner: CommandRunner, remote_args: Sequence[str]) -> List[st
     ssh_args = ["ssh"]
     if runner.ssh_batch:
         ssh_args.extend(["-o", "BatchMode=yes"])
-    ssh_args.extend(["-o", "ConnectTimeout=10"])
+    ssh_args.extend(
+        [
+            "-o",
+            "ConnectTimeout=10",
+            "-o",
+            "ServerAliveInterval=15",
+            "-o",
+            "ServerAliveCountMax=2",
+            "-o",
+            "ConnectionAttempts=2",
+        ]
+    )
     if runner.ssh_port is not None:
         ssh_args.extend(["-p", str(runner.ssh_port)])
     if runner.ssh_key:
@@ -240,31 +267,145 @@ def build_ssh_args(runner: CommandRunner, remote_args: Sequence[str]) -> List[st
     return ssh_args
 
 
+def build_ssh_shell_args(runner: CommandRunner, script: str) -> List[str]:
+    ssh_args = build_ssh_args(runner, ["true"])
+    ssh_args[-1] = "sh -lc " + shlex.quote(script)
+    return ssh_args
+
+
+def transient_ssh_error(message: str) -> bool:
+    message = message.lower()
+    return any(
+        pattern in message
+        for pattern in (
+            "connection closed",
+            "connection reset",
+            "connection aborted",
+            "timed out",
+            "broken pipe",
+        )
+    )
+
+
 def run_command(args: Sequence[str], runner: CommandRunner) -> Tuple[str, Optional[str]]:
     command = list(args)
     if runner.backend == "ssh":
         command = build_ssh_args(runner, command)
 
-    try:
-        result = subprocess.run(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            check=False,
-            timeout=runner.timeout,
-        )
-    except FileNotFoundError:
-        if runner.backend == "ssh":
-            return "", "command not found: ssh"
-        return "", f"command not found: {args[0]}"
-    except subprocess.TimeoutExpired:
-        return "", f"{runner.label} timed out running {args[0]}"
+    attempts = 2 if runner.backend == "ssh" else 1
+    last_error = ""
+    for attempt in range(attempts):
+        try:
+            result = subprocess.run(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+                timeout=runner.timeout,
+            )
+        except FileNotFoundError:
+            if runner.backend == "ssh":
+                return "", "command not found: ssh"
+            return "", f"command not found: {args[0]}"
+        except subprocess.TimeoutExpired:
+            last_error = f"{runner.label} timed out running {args[0]}"
+            if attempt + 1 < attempts and transient_ssh_error(last_error):
+                time.sleep(0.5)
+                continue
+            return "", last_error
 
-    if result.returncode != 0:
+        if result.returncode == 0:
+            return result.stdout, None
+
         message = result.stderr.strip() or result.stdout.strip()
-        return "", f"{runner.label} {args[0]} failed: {message}"
-    return result.stdout, None
+        last_error = f"{runner.label} {args[0]} failed: {message}"
+        if attempt + 1 < attempts and transient_ssh_error(last_error):
+            time.sleep(0.5)
+            continue
+        return "", last_error
+    return "", last_error
+
+
+def run_ssh_batch(
+    runner: CommandRunner,
+    commands: Sequence[Tuple[str, Sequence[str]]],
+) -> Tuple[Dict[str, str], List[str]]:
+    script_lines: List[str] = []
+    for name, args in commands:
+        script_lines.append(f"printf '%s\\n' {shlex.quote(SECTION_MARKER + ' BEGIN ' + name)}")
+        script_lines.append(f"{{ {make_remote_command(args)}; }} 2>&1")
+        script_lines.append("rc=$?")
+        script_lines.append(
+            f"printf '%s %s\\n' {shlex.quote(SECTION_MARKER + ' END ' + name)} \"$rc\""
+        )
+    script = "\n".join(script_lines)
+    command = build_ssh_shell_args(runner, script)
+    attempts = 2
+    last_error = ""
+
+    for attempt in range(attempts):
+        try:
+            result = subprocess.run(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+                timeout=max(runner.timeout, runner.timeout * len(commands)),
+            )
+        except FileNotFoundError:
+            return {}, ["command not found: ssh"]
+        except subprocess.TimeoutExpired:
+            last_error = f"{runner.label} timed out running Slurm batch"
+            if attempt + 1 < attempts:
+                time.sleep(0.5)
+                continue
+            return {}, [last_error]
+
+        stderr = result.stderr.strip()
+        stdout = result.stdout
+        combined_error = stderr or stdout.strip()
+        if result.returncode != 0 and transient_ssh_error(combined_error):
+            last_error = f"{runner.label} Slurm batch failed: {combined_error}"
+            if attempt + 1 < attempts:
+                time.sleep(0.5)
+                continue
+
+        sections: Dict[str, List[str]] = {}
+        return_codes: Dict[str, int] = {}
+        current: Optional[str] = None
+        for line in stdout.splitlines():
+            if line.startswith(SECTION_MARKER + " BEGIN "):
+                current = line.split(" BEGIN ", 1)[1].strip()
+                sections[current] = []
+                continue
+            if line.startswith(SECTION_MARKER + " END "):
+                rest = line.split(" END ", 1)[1].strip()
+                parts = rest.rsplit(" ", 1)
+                if len(parts) == 2:
+                    name, rc = parts
+                    return_codes[name] = parse_int(rc)
+                current = None
+                continue
+            if current:
+                sections.setdefault(current, []).append(line)
+
+        outputs = {name: "\n".join(lines) for name, lines in sections.items()}
+        warnings: List[str] = []
+        if result.returncode != 0:
+            warnings.append(f"{runner.label} Slurm batch failed: {combined_error}")
+        for name, args in commands:
+            rc = return_codes.get(name, 0)
+            if rc != 0:
+                output = outputs.get(name, "").strip()
+                warning = f"{runner.label} {args[0]} failed"
+                if output:
+                    warning += f": {output}"
+                warnings.append(warning)
+        return outputs, warnings
+
+    return {}, [last_error]
 
 
 def split_row(line: str, expected_fields: int) -> Optional[List[str]]:
@@ -274,20 +415,18 @@ def split_row(line: str, expected_fields: int) -> Optional[List[str]]:
     return [field.strip() for field in fields]
 
 
-def load_squeue_jobs(
-    runner: CommandRunner,
-    user: str,
-    job_ids: Sequence[str],
-) -> Tuple[Dict[str, Job], List[str]]:
+def build_squeue_jobs_args(user: str, job_ids: Sequence[str]) -> List[str]:
     fmt = DELIM.join(["%i", "%T", "%j", "%P", "%M", "%l", "%D", "%R"])
     args = ["squeue", "-h", "-o", fmt]
     if user:
         args.extend(["--user", user])
     if job_ids:
         args.extend(["--jobs", ",".join(job_ids)])
+    return args
 
-    output, error = run_command(args, runner)
-    warnings = [error] if error else []
+
+def parse_squeue_jobs_output(output: str, user: str) -> Tuple[Dict[str, Job], List[str]]:
+    warnings: List[str] = []
     jobs: Dict[str, Job] = {}
 
     for line in output.splitlines():
@@ -315,12 +454,23 @@ def load_squeue_jobs(
     return jobs, warnings
 
 
-def load_sacct_jobs(
+def load_squeue_jobs(
     runner: CommandRunner,
     user: str,
     job_ids: Sequence[str],
-    since: datetime,
 ) -> Tuple[Dict[str, Job], List[str]]:
+    output, error = run_command(build_squeue_jobs_args(user, job_ids), runner)
+    jobs, warnings = parse_squeue_jobs_output(output, user)
+    if error:
+        warnings.insert(0, error)
+    return jobs, warnings
+
+
+def build_sacct_jobs_args(
+    user: str,
+    job_ids: Sequence[str],
+    since: datetime,
+) -> List[str]:
     fields = [
         "JobIDRaw",
         "JobName",
@@ -349,15 +499,18 @@ def load_sacct_jobs(
         args.extend(["--user", user])
     if job_ids:
         args.extend(["--jobs", ",".join(job_ids)])
+    return args
 
-    output, error = run_command(args, runner)
-    warnings = [error] if error else []
+
+def parse_sacct_jobs_output(output: str, user: str) -> Tuple[Dict[str, Job], List[str]]:
+    warnings: List[str] = []
+    fields_count = 12
     jobs: Dict[str, Job] = {}
 
     for line in output.splitlines():
         if not line.strip():
             continue
-        row = split_row(line, len(fields))
+        row = split_row(line, fields_count)
         if row is None:
             if DELIM in line:
                 warnings.append(f"could not parse sacct row: {line!r}")
@@ -395,6 +548,19 @@ def load_sacct_jobs(
     return jobs, warnings
 
 
+def load_sacct_jobs(
+    runner: CommandRunner,
+    user: str,
+    job_ids: Sequence[str],
+    since: datetime,
+) -> Tuple[Dict[str, Job], List[str]]:
+    output, error = run_command(build_sacct_jobs_args(user, job_ids, since), runner)
+    jobs, warnings = parse_sacct_jobs_output(output, user)
+    if error:
+        warnings.insert(0, error)
+    return jobs, warnings
+
+
 def add_node_state(summary: PartitionSummary, state: str, count: int) -> None:
     state = clean_optional(state).lower()
     summary.nodes_total += count
@@ -412,23 +578,29 @@ def add_node_state(summary: PartitionSummary, state: str, count: int) -> None:
         summary.nodes_other += count
 
 
-def load_sinfo_partitions(
-    runner: CommandRunner,
+def build_sinfo_partitions_args() -> List[str]:
+    # %T splits states into separate rows; %C already totals CPUs in each row.
+    fmt = DELIM.join(["%P", "%a", "%l", "%D", "%T", "%C"])
+    return ["sinfo", "-h", "-o", fmt]
+
+
+def parse_sinfo_partitions_output(
+    output: str,
 ) -> Tuple[Dict[str, PartitionSummary], List[str]]:
-    fmt = DELIM.join(["%P", "%a", "%l", "%D", "%T"])
-    output, error = run_command(["sinfo", "-h", "-o", fmt], runner)
-    warnings = [error] if error else []
+    warnings: List[str] = []
     partitions: Dict[str, PartitionSummary] = {}
+    invalid_cpu_partitions = set()
 
     for line in output.splitlines():
         if not line.strip():
             continue
-        fields = split_row(line, 5)
+        fields = split_row(line, 6)
         if fields is None:
             if DELIM in line:
+                invalid_cpu_partitions.add(normalize_partition(line.split(DELIM, 1)[0]))
                 warnings.append(f"could not parse sinfo row: {line!r}")
             continue
-        raw_partition, availability, max_time, nodes, node_state = fields
+        raw_partition, availability, max_time, nodes, node_state, cpu_states = fields
         partition = normalize_partition(raw_partition)
         summary = partitions.setdefault(partition, PartitionSummary(partition=partition))
         if availability.lower() == "up" or not summary.availability:
@@ -436,16 +608,50 @@ def load_sinfo_partitions(
         if max_time and not summary.max_time:
             summary.max_time = max_time
         add_node_state(summary, node_state, parse_int(nodes))
+        try:
+            cpu_counts = [int(cpu_count) for cpu_count in cpu_states.split("/")]
+            if len(cpu_counts) != 4 or any(cpu_count < 0 for cpu_count in cpu_counts):
+                raise ValueError("expected four nonnegative CPU counts")
+            cpus_allocated, cpus_idle, cpus_other, cpus_total = cpu_counts
+            if cpus_allocated + cpus_idle + cpus_other != cpus_total:
+                raise ValueError("CPU states do not add up to total")
+        except ValueError:
+            invalid_cpu_partitions.add(partition)
+            warnings.append(f"could not parse sinfo CPU counts for {partition}: {cpu_states!r}")
+            continue
+        summary.cpus_allocated += cpus_allocated
+        summary.cpus_idle += cpus_idle
+        summary.cpus_other += cpus_other
+        summary.cpus_total += cpus_total
+        summary.cpus_available = True
+
+    for partition in invalid_cpu_partitions:
+        # Do not present a partial sum as the full partition's CPU capacity.
+        if partition in partitions:
+            partitions[partition].cpus_available = False
 
     return partitions, warnings
 
 
-def load_partition_queue_counts(
+def load_sinfo_partitions(
     runner: CommandRunner,
-) -> Tuple[Dict[str, Dict[str, int]], List[str]]:
+) -> Tuple[Dict[str, PartitionSummary], List[str]]:
+    output, error = run_command(build_sinfo_partitions_args(), runner)
+    partitions, warnings = parse_sinfo_partitions_output(output)
+    if error:
+        warnings.insert(0, error)
+    return partitions, warnings
+
+
+def build_partition_queue_counts_args() -> List[str]:
     fmt = DELIM.join(["%P", "%T"])
-    output, error = run_command(["squeue", "-h", "-o", fmt], runner)
-    warnings = [error] if error else []
+    return ["squeue", "-h", "-o", fmt]
+
+
+def parse_partition_queue_counts_output(
+    output: str,
+) -> Tuple[Dict[str, Dict[str, int]], List[str]]:
+    warnings: List[str] = []
     counts: Dict[str, Dict[str, int]] = {}
 
     for line in output.splitlines():
@@ -469,6 +675,16 @@ def load_partition_queue_counts(
         else:
             bucket["other"] += 1
 
+    return counts, warnings
+
+
+def load_partition_queue_counts(
+    runner: CommandRunner,
+) -> Tuple[Dict[str, Dict[str, int]], List[str]]:
+    output, error = run_command(build_partition_queue_counts_args(), runner)
+    counts, warnings = parse_partition_queue_counts_output(output)
+    if error:
+        warnings.insert(0, error)
     return counts, warnings
 
 
@@ -678,13 +894,13 @@ def choose_display_jobs(
     active: Dict[str, Job],
     limit: int,
 ) -> List[Job]:
-    """Show all live squeue jobs first; fill the rest with local history."""
+    """Show live jobs first, then recent history, within the display limit."""
     history_limit = max(limit - len(active), 0)
     jobs = list(active.values())
     if history_limit:
         jobs.extend(load_recorded_jobs(conn, history_limit, active.keys()))
     jobs.sort(key=sort_key)
-    return jobs
+    return jobs[:limit]
 
 
 def combine_jobs(active: Dict[str, Job], accounted: Dict[str, Job]) -> Dict[str, Job]:
@@ -698,7 +914,7 @@ def partition_sort_key(summary: PartitionSummary) -> Tuple[int, int, int, str]:
     return (
         availability_rank,
         -(summary.jobs_queued + summary.jobs_running),
-        -summary.nodes_total,
+        -summary.cpus_total if summary.cpus_available else 0,
         summary.partition,
     )
 
@@ -710,7 +926,14 @@ def load_partition_summaries(
     partitions, warnings = load_sinfo_partitions(runner)
     queue_counts, queue_warnings = load_partition_queue_counts(runner)
     warnings.extend(queue_warnings)
+    return combine_partition_summaries(partitions, queue_counts, active_user_jobs), warnings
 
+
+def combine_partition_summaries(
+    partitions: Dict[str, PartitionSummary],
+    queue_counts: Dict[str, Dict[str, int]],
+    active_user_jobs: Dict[str, Job],
+) -> List[PartitionSummary]:
     for partition, counts in queue_counts.items():
         summary = partitions.setdefault(
             partition,
@@ -727,12 +950,59 @@ def load_partition_summaries(
         )
         if job.category == "queued":
             summary.user_queued += 1
+            pending_reason = job.reason.strip().strip("()") or "Unknown"
+            summary.user_pending_reasons[pending_reason] = (
+                summary.user_pending_reasons.get(pending_reason, 0) + 1
+            )
         elif job.category == "running":
             summary.user_running += 1
 
-    result = list(partitions.values())
-    result.sort(key=partition_sort_key)
-    return result, warnings
+    partition_summaries = list(partitions.values())
+    partition_summaries.sort(key=partition_sort_key)
+    return partition_summaries
+
+
+def poll_jobs_ssh_batch(
+    conn: sqlite3.Connection,
+    runner: CommandRunner,
+    user: str,
+    job_ids: Sequence[str],
+    since_days: int,
+    no_sacct: bool,
+    limit: int,
+) -> Tuple[List[Job], List[PartitionSummary], List[str]]:
+    since = datetime.now() - timedelta(days=since_days)
+    commands: List[Tuple[str, Sequence[str]]] = [
+        ("active_jobs", build_squeue_jobs_args(user, job_ids)),
+        ("sinfo", build_sinfo_partitions_args()),
+        ("partition_queue", build_partition_queue_counts_args()),
+    ]
+    if not no_sacct:
+        commands.insert(1, ("accounted_jobs", build_sacct_jobs_args(user, job_ids, since)))
+
+    outputs, warnings = run_ssh_batch(runner, commands)
+    active, active_warnings = parse_squeue_jobs_output(outputs.get("active_jobs", ""), user)
+    warnings.extend(active_warnings)
+
+    accounted: Dict[str, Job] = {}
+    if not no_sacct:
+        accounted, sacct_warnings = parse_sacct_jobs_output(
+            outputs.get("accounted_jobs", ""),
+            user,
+        )
+        warnings.extend(sacct_warnings)
+
+    partitions, sinfo_warnings = parse_sinfo_partitions_output(outputs.get("sinfo", ""))
+    warnings.extend(sinfo_warnings)
+    queue_counts, queue_warnings = parse_partition_queue_counts_output(
+        outputs.get("partition_queue", "")
+    )
+    warnings.extend(queue_warnings)
+
+    current = combine_jobs(active, accounted)
+    record_jobs(conn, current.values())
+    partition_summaries = combine_partition_summaries(partitions, queue_counts, active)
+    return choose_display_jobs(conn, active, limit), partition_summaries, warnings
 
 
 def poll_jobs(
@@ -744,6 +1014,17 @@ def poll_jobs(
     no_sacct: bool,
     limit: int,
 ) -> Tuple[List[Job], List[PartitionSummary], List[str]]:
+    if runner.backend == "ssh":
+        return poll_jobs_ssh_batch(
+            conn,
+            runner,
+            user,
+            job_ids,
+            since_days,
+            no_sacct,
+            limit,
+        )
+
     since = datetime.now() - timedelta(days=since_days)
     active, warnings = load_squeue_jobs(runner, user, job_ids)
     accounted: Dict[str, Job] = {}
@@ -859,11 +1140,18 @@ def partition_to_dict(summary: PartitionSummary) -> Dict[str, object]:
         "nodes_draining": summary.nodes_draining,
         "nodes_other": summary.nodes_other,
         "load_text": summary.load_text,
+        "cpus_total": summary.cpus_total if summary.cpus_available else None,
+        "cpus_allocated": summary.cpus_allocated if summary.cpus_available else None,
+        "cpus_idle": summary.cpus_idle if summary.cpus_available else None,
+        "cpus_other": summary.cpus_other if summary.cpus_available else None,
+        "cpus_available": summary.cpus_available,
+        "cpu_load_text": summary.cpu_load_text,
         "jobs_queued": summary.jobs_queued,
         "jobs_running": summary.jobs_running,
         "jobs_other": summary.jobs_other,
         "user_queued": summary.user_queued,
         "user_running": summary.user_running,
+        "user_pending_reasons": summary.user_pending_reasons,
     }
 
 
@@ -917,8 +1205,8 @@ def render(
         print("Partitions:")
         print(
             f"{'PARTITION':<14} {'AVAIL':<7} {'QUEUED':>6} {'RUN':>5} "
-            f"{'MINE_Q':>6} {'MINE_R':>6} {'NODES':>9} "
-            f"{'IDLE':>5} {'DOWN':>5} {'DRAIN':>5} {'LIMIT':>10}"
+            f"{'MINE_Q':>6} {'MINE_R':>6} {'CPUS A/T':>13} "
+            f"{'UNALLOC':>7} {'OTHER':>7} {'LIMIT':>10}"
         )
         print("-" * min(width, 100))
         for part in partitions[:20]:
@@ -929,12 +1217,17 @@ def render(
                 f"{part.jobs_running:>5} "
                 f"{part.user_queued:>6} "
                 f"{part.user_running:>6} "
-                f"{part.load_text:>9} "
-                f"{part.nodes_idle:>5} "
-                f"{part.nodes_down:>5} "
-                f"{part.nodes_draining:>5} "
+                f"{part.cpu_load_text:>13} "
+                f"{str(part.cpus_idle) if part.cpus_available else '-':>7} "
+                f"{str(part.cpus_other) if part.cpus_available else '-':>7} "
                 f"{truncate(part.max_time, 10):>10}"
             )
+            if part.user_pending_reasons:
+                pending_reason_text = "; ".join(
+                    f"{pending_reason}: {pending_count}"
+                    for pending_reason, pending_count in sorted(part.user_pending_reasons.items())
+                )
+                print(f"  My pending reasons: {pending_reason_text}")
         print()
 
     if not jobs:
@@ -981,11 +1274,10 @@ WEB_HTML = r"""<!doctype html>
   --green-light: #2fbf71;
   --red-light: #d94b4b;
   --gray-light: #9aa4b2;
-  --node-red: #d94b4b;
-  --node-yellow: #f2c94c;
-  --node-blue: #3b82d6;
-  --node-green: #2fbf71;
-  --node-gray: #9aa4b2;
+  --cpu-red: #d94b4b;
+  --cpu-yellow: #f2c94c;
+  --cpu-unallocated: #3b82d6;
+  --cpu-gray: #9aa4b2;
 }
 * { box-sizing: border-box; }
 body {
@@ -1038,10 +1330,12 @@ h1 {
 }
 .light-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, 34px);
+  grid-template-columns: repeat(20, 34px);
   grid-auto-rows: 34px;
   gap: 14px;
   align-items: center;
+  overflow-x: auto;
+  padding: 6px;
 }
 .job-light {
   width: 34px;
@@ -1082,8 +1376,8 @@ h1 {
 }
 .partition-strip {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
-  gap: 10px;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr));
+  gap: 16px;
   margin-bottom: 26px;
 }
 .partition-item {
@@ -1091,7 +1385,7 @@ h1 {
   border: 1px solid var(--line);
   border-radius: 8px;
   background: #ffffff;
-  padding: 10px 12px;
+  padding: 18px 20px;
   color: inherit;
   cursor: pointer;
   font: inherit;
@@ -1109,14 +1403,14 @@ h1 {
   align-items: center;
   justify-content: space-between;
   gap: 10px;
-  margin-bottom: 8px;
+  margin-bottom: 18px;
 }
 .partition-name {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  font-size: 13px;
+  font-size: 15px;
   font-weight: 650;
 }
 .partition-avail {
@@ -1129,58 +1423,57 @@ h1 {
   white-space: nowrap;
 }
 .partition-avail[data-up="true"] {
-  color: #17633a;
-  border-color: rgba(47, 191, 113, 0.4);
+  color: var(--muted);
 }
 .partition-metrics {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 8px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 18px;
 }
 .partition-body {
   display: grid;
-  grid-template-columns: 62px minmax(0, 1fr);
-  gap: 12px;
-  align-items: center;
+  gap: 16px;
 }
-.partition-pie {
-  position: relative;
-  width: 62px;
-  height: 62px;
-  border-radius: 50%;
-  background: var(--node-gray);
-  box-shadow:
-    inset 0 0 0 1px rgba(31, 41, 51, 0.14),
-    0 4px 10px rgba(31, 41, 51, 0.1);
-}
-.partition-pie::after {
-  content: "";
-  position: absolute;
-  inset: 17px;
-  border-radius: 50%;
-  background: #ffffff;
-  box-shadow: inset 0 0 0 1px rgba(31, 41, 51, 0.08);
-}
-.partition-pie-total {
-  position: absolute;
-  inset: 0;
-  z-index: 1;
+.partition-cpu-load {
   display: flex;
-  align-items: center;
-  justify-content: center;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 6px 16px;
+  color: var(--muted);
   font-size: 12px;
-  font-weight: 650;
+}
+.partition-cpu-load strong {
+  color: var(--ink);
+  font-size: 20px;
+  font-weight: 600;
   font-variant-numeric: tabular-nums;
+}
+.partition-cpu-bar {
+  display: flex;
+  height: 6px;
+  border-radius: 3px;
+  overflow: hidden;
+  background: var(--cpu-gray);
+}
+.partition-cpu-bar span {
+  height: 100%;
+}
+.partition-note {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.6;
+  margin: 0 0 14px;
 }
 .metric-label {
   display: block;
   color: var(--muted);
-  font-size: 10px;
+  font-size: 12px;
 }
 .metric-value {
   display: block;
-  margin-top: 2px;
-  font-size: 13px;
+  margin-top: 6px;
+  font-size: 16px;
   font-variant-numeric: tabular-nums;
 }
 .backdrop {
@@ -1230,7 +1523,7 @@ h1 {
   line-height: 1;
   cursor: pointer;
 }
-.node-chart-section {
+.cpu-chart-section {
   display: grid;
   grid-template-columns: 132px minmax(0, 1fr);
   gap: 16px;
@@ -1238,17 +1531,17 @@ h1 {
   padding: 18px 22px;
   border-bottom: 1px solid var(--line);
 }
-.node-pie {
+.cpu-pie {
   position: relative;
   width: 132px;
   height: 132px;
   border-radius: 50%;
-  background: var(--node-gray);
+  background: var(--cpu-gray);
   box-shadow:
     inset 0 0 0 1px rgba(31, 41, 51, 0.14),
     0 8px 20px rgba(31, 41, 51, 0.12);
 }
-.node-pie::after {
+.cpu-pie::after {
   content: "";
   position: absolute;
   inset: 34px;
@@ -1256,7 +1549,7 @@ h1 {
   background: var(--panel);
   box-shadow: inset 0 0 0 1px rgba(31, 41, 51, 0.08);
 }
-.node-pie-total {
+.cpu-pie-total {
   position: absolute;
   inset: 0;
   z-index: 1;
@@ -1267,31 +1560,31 @@ h1 {
   font-weight: 650;
   font-variant-numeric: tabular-nums;
 }
-.node-legend {
+.cpu-legend {
   display: grid;
   gap: 8px;
   min-width: 0;
 }
-.node-legend-row {
+.cpu-legend-row {
   display: grid;
   grid-template-columns: 12px minmax(0, 1fr) auto;
   gap: 8px;
   align-items: center;
   font-size: 12px;
 }
-.node-swatch {
+.cpu-swatch {
   width: 12px;
   height: 12px;
   border-radius: 3px;
   box-shadow: inset 0 0 0 1px rgba(31, 41, 51, 0.16);
 }
-.node-label {
+.cpu-label {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.node-value {
+.cpu-value {
   color: var(--muted);
   font-variant-numeric: tabular-nums;
 }
@@ -1331,7 +1624,7 @@ h1 {
     padding-top: 22px;
   }
   .light-grid {
-    grid-template-columns: repeat(auto-fill, 32px);
+    grid-template-columns: repeat(20, 32px);
     grid-auto-rows: 32px;
     gap: 12px;
   }
@@ -1339,14 +1632,14 @@ h1 {
     width: 32px;
     height: 32px;
   }
-  .node-chart-section {
+  .cpu-chart-section {
     grid-template-columns: 112px minmax(0, 1fr);
   }
-  .node-pie {
+  .cpu-pie {
     width: 112px;
     height: 112px;
   }
-  .node-pie::after {
+  .cpu-pie::after {
     inset: 29px;
   }
 }
@@ -1359,6 +1652,7 @@ h1 {
 </header>
 <main class="wrap">
   <div class="status-line" id="status">Loading Slurm data...</div>
+  <p class="partition-note">Unallocated CPUs are not guaranteed available to your jobs. Partitions may share nodes. Select a partition for your pending reasons.</p>
   <section class="partition-strip" id="partitions" aria-label="Partitions"></section>
   <section class="light-grid" id="lights" aria-label="Slurm jobs"></section>
 </main>
@@ -1371,11 +1665,11 @@ h1 {
     </div>
     <button class="close" id="close" type="button" aria-label="Close">&times;</button>
   </div>
-  <section class="node-chart-section" id="node-chart" hidden>
-    <div class="node-pie" id="node-pie" aria-label="Node state pie chart">
-      <span class="node-pie-total" id="node-pie-total"></span>
+  <section class="cpu-chart-section" id="cpu-chart" hidden>
+    <div class="cpu-pie" id="cpu-pie" aria-label="CPU allocation pie chart">
+      <span class="cpu-pie-total" id="cpu-pie-total"></span>
     </div>
-    <div class="node-legend" id="node-legend"></div>
+    <div class="cpu-legend" id="cpu-legend"></div>
   </section>
   <dl class="details" id="details"></dl>
 </aside>
@@ -1389,10 +1683,10 @@ const backdrop = document.getElementById("backdrop");
 const detailTitle = document.getElementById("detail-title");
 const detailSubtitle = document.getElementById("detail-subtitle");
 const details = document.getElementById("details");
-const nodeChart = document.getElementById("node-chart");
-const nodePie = document.getElementById("node-pie");
-const nodePieTotal = document.getElementById("node-pie-total");
-const nodeLegend = document.getElementById("node-legend");
+const cpuChart = document.getElementById("cpu-chart");
+const cpuPie = document.getElementById("cpu-pie");
+const cpuPieTotal = document.getElementById("cpu-pie-total");
+const cpuLegend = document.getElementById("cpu-legend");
 const closeButton = document.getElementById("close");
 let jobsById = new Map();
 let selectedJobId = null;
@@ -1416,45 +1710,43 @@ function percent(value, total) {
   return `${((Number(value || 0) / total) * 100).toFixed(1)}%`;
 }
 
-function nodeSlices(partition) {
+function cpuSlices(partition) {
+  if (!partition.cpus_available) return [];
   return [
-    ["Down", Number(partition.nodes_down || 0), "var(--node-red)"],
-    ["Draining", Number(partition.nodes_draining || 0), "var(--node-red)"],
-    ["Allocated", Number(partition.nodes_allocated || 0), "var(--node-yellow)"],
-    ["Mixed", Number(partition.nodes_mixed || 0), "var(--node-blue)"],
-    ["Idle", Number(partition.nodes_idle || 0), "var(--node-green)"],
-    ["Other", Number(partition.nodes_other || 0), "var(--node-gray)"],
+    ["Allocated CPUs", Number(partition.cpus_allocated), "var(--cpu-yellow)"],
+    ["Unallocated CPUs", Number(partition.cpus_idle), "var(--cpu-unallocated)"],
+    ["Other CPUs", Number(partition.cpus_other), "var(--cpu-red)"],
   ];
 }
 
-function nodePieGradient(slices, total) {
-  if (!total) return "var(--node-gray)";
+function cpuPieGradient(cpuSlices, cpuTotal) {
+  if (!cpuTotal) return "var(--cpu-gray)";
   let cursor = 0;
-  const segments = [];
-  slices.forEach(([, value, color]) => {
+  const cpuSegments = [];
+  cpuSlices.forEach(([, value, color]) => {
     if (!value) return;
     const start = cursor;
-    cursor += (value / total) * 360;
-    segments.push(`${color} ${start.toFixed(3)}deg ${cursor.toFixed(3)}deg`);
+    cursor += (value / cpuTotal) * 360;
+    cpuSegments.push(`${color} ${start.toFixed(3)}deg ${cursor.toFixed(3)}deg`);
   });
-  return segments.length
-    ? `conic-gradient(${segments.join(", ")})`
-    : "var(--node-gray)";
+  return cpuSegments.length
+    ? `conic-gradient(${cpuSegments.join(", ")})`
+    : "var(--cpu-gray)";
 }
 
-function renderNodeChart(partition) {
-  const slices = nodeSlices(partition);
-  const total = slices.reduce((sum, [, value]) => sum + value, 0);
-  nodePie.style.background = nodePieGradient(slices, total);
-  nodePieTotal.textContent = String(total);
-  nodeLegend.innerHTML = slices.map(([label, value, color]) => `
-    <div class="node-legend-row">
-      <span class="node-swatch" style="background: ${color}"></span>
-      <span class="node-label">${escapeHtml(label)}</span>
-      <span class="node-value">${escapeHtml(value)} (${escapeHtml(percent(value, total))})</span>
+function renderCpuChart(partition) {
+  const partitionCpuSlices = cpuSlices(partition);
+  const cpuTotal = partitionCpuSlices.reduce((sum, [, value]) => sum + value, 0);
+  cpuPie.style.background = cpuPieGradient(partitionCpuSlices, cpuTotal);
+  cpuPieTotal.textContent = partition.cpus_available ? String(cpuTotal) : "-";
+  cpuLegend.innerHTML = partitionCpuSlices.map(([label, value, color]) => `
+    <div class="cpu-legend-row">
+      <span class="cpu-swatch" style="background: ${color}"></span>
+      <span class="cpu-label">${escapeHtml(label)}</span>
+      <span class="cpu-value">${escapeHtml(value)} (${escapeHtml(percent(value, cpuTotal))})</span>
     </div>
-  `).join("");
-  nodeChart.hidden = false;
+  `).join("") || "CPU counts unavailable";
+  cpuChart.hidden = false;
 }
 
 function renderSummary(data) {
@@ -1478,7 +1770,7 @@ function renderSummary(data) {
 function openDetail(job) {
   selectedJobId = job.job_id;
   selectedPartitionName = null;
-  nodeChart.hidden = true;
+  cpuChart.hidden = true;
   detailTitle.textContent = `${job.job_id}  ${job.state}`;
   detailSubtitle.textContent = job.job_name || job.partition || "";
   const fields = [
@@ -1509,11 +1801,23 @@ function openPartitionDetail(partition) {
   selectedPartitionName = partition.partition;
   const downTotal = Number(partition.nodes_down || 0) + Number(partition.nodes_draining || 0);
   detailTitle.textContent = partition.partition;
-  detailSubtitle.textContent = `Availability ${text(partition.availability)}`;
-  renderNodeChart(partition);
-  const fields = [
+  detailSubtitle.textContent = `Availability ${text(partition.availability)} · Slurm CPU allocation (cores or hardware threads)`;
+  renderCpuChart(partition);
+  const pendingReasonEntries = Object.entries(partition.user_pending_reasons || {})
+    .sort((firstReason, secondReason) => secondReason[1] - firstReason[1]);
+  const pendingReasonText = pendingReasonEntries
+    .map(([pendingReason, pendingCount]) => `${pendingReason}: ${pendingCount}`)
+    .join("; ") || "No pending jobs in this query";
+  const partitionFields = [
     ["Availability", partition.availability],
     ["Max Time", partition.max_time],
+    ["CPUs Allocated / Total", partition.cpu_load_text],
+    ["CPUs Total", partition.cpus_total],
+    ["CPUs Allocated", partition.cpus_allocated],
+    ["CPUs Unallocated", partition.cpus_idle],
+    ["CPUs Other", partition.cpus_other],
+    ["My Pending Reasons", pendingReasonText],
+    ["Scheduling", "Unallocated CPUs may be fragmented or reserved. Memory, time limits, priority, QoS and dependencies can prevent a job from starting."],
     ["Queue Jobs", partition.jobs_queued],
     ["Running Jobs", partition.jobs_running],
     ["Other Jobs", partition.jobs_other],
@@ -1529,7 +1833,7 @@ function openPartitionDetail(partition) {
     ["Nodes Down+Drain", downTotal],
     ["Nodes Other", partition.nodes_other],
   ];
-  details.innerHTML = fields.map(([key, value]) =>
+  details.innerHTML = partitionFields.map(([key, value]) =>
     `<dt>${escapeHtml(key)}</dt><dd>${escapeHtml(value)}</dd>`
   ).join("");
   detail.hidden = false;
@@ -1539,7 +1843,7 @@ function openPartitionDetail(partition) {
 function closeDetail() {
   selectedJobId = null;
   selectedPartitionName = null;
-  nodeChart.hidden = true;
+  cpuChart.hidden = true;
   detail.hidden = true;
   backdrop.hidden = true;
 }
@@ -1562,40 +1866,39 @@ function renderLights(data) {
   }
 }
 
-function renderPartitions(data) {
+function renderPartitions(partitionPayload) {
   partitions.replaceChildren();
-  (data.partitions || []).forEach(partition => {
+  (partitionPayload.partitions || []).forEach(partition => {
     const item = document.createElement("button");
     item.type = "button";
     item.className = "partition-item";
     const isUp = String(partition.availability || "").toLowerCase() === "up";
     item.title = `${partition.partition} availability ${partition.availability}`;
     item.setAttribute("aria-label", item.title);
-    const slices = nodeSlices(partition);
-    const nodeTotal = slices.reduce((sum, [, value]) => sum + value, 0);
+    const partitionCpuSlices = cpuSlices(partition);
+    const cpuTotal = partitionCpuSlices.reduce((sum, [, value]) => sum + value, 0);
     item.innerHTML = `
       <div class="partition-head">
         <div class="partition-name" title="${escapeHtml(partition.partition)}">${escapeHtml(partition.partition)}</div>
-        <div class="partition-avail" data-up="${isUp}" title="Partition availability from sinfo">Avail ${escapeHtml(partition.availability)}</div>
+        <div class="partition-avail" data-up="${isUp}" title="Partition state, not a guarantee that your job can start">State ${escapeHtml(partition.availability)}</div>
       </div>
       <div class="partition-body">
-        <div class="partition-pie" style="background: ${nodePieGradient(slices, nodeTotal)}" aria-label="Node state pie chart">
-          <span class="partition-pie-total">${escapeHtml(nodeTotal)}</span>
+        <div class="partition-cpu-load" title="Allocated / total Slurm CPUs (cores or hardware threads)">
+          <span>Allocated CPUs</span><strong>${escapeHtml(partition.cpu_load_text)}</strong>
+        </div>
+        <div class="partition-cpu-bar" aria-label="CPU allocation: allocated, unallocated, other">
+          ${partitionCpuSlices.map(([, cpuCount, cpuColor]) => `<span style="width: ${percent(cpuCount, cpuTotal)}; background: ${cpuColor}"></span>`).join("")}
         </div>
         <div class="partition-metrics">
-          <div><span class="metric-label">Queue</span><span class="metric-value">${escapeHtml(partition.jobs_queued)}</span></div>
-          <div><span class="metric-label">Run</span><span class="metric-value">${escapeHtml(partition.jobs_running)}</span></div>
-          <div><span class="metric-label">Mine</span><span class="metric-value">${escapeHtml(partition.user_queued)} / ${escapeHtml(partition.user_running)}</span></div>
-          <div><span class="metric-label">Nodes</span><span class="metric-value">${escapeHtml(partition.load_text)}</span></div>
-          <div><span class="metric-label">Idle</span><span class="metric-value">${escapeHtml(partition.nodes_idle)}</span></div>
-          <div><span class="metric-label">Down</span><span class="metric-value">${escapeHtml(partition.nodes_down + partition.nodes_draining)}</span></div>
+          <div title="Slurm idle CPUs; not necessarily schedulable for your jobs"><span class="metric-label">Unallocated</span><span class="metric-value">${escapeHtml(partition.cpus_idle)}</span></div>
+          <div title="Open details to see the pending reasons from Slurm"><span class="metric-label">My queued</span><span class="metric-value">${escapeHtml(partition.user_queued)}</span></div>
         </div>
       </div>`;
     item.addEventListener("click", () => openPartitionDetail(partition));
     partitions.appendChild(item);
   });
   if (selectedPartitionName) {
-    const selected = (data.partitions || []).find(
+    const selected = (partitionPayload.partitions || []).find(
       partition => partition.partition === selectedPartitionName
     );
     if (selected) openPartitionDetail(selected);
@@ -1799,6 +2102,12 @@ def run_web(args: argparse.Namespace, job_ids: List[str], db_path: str) -> int:
     print(f"Slurm Tracker web UI: http://{host}:{port}/", flush=True)
     print(f"Backend: {config.runner.label}", flush=True)
     print(f"Database: {db_path}", flush=True)
+    if platform.system().lower() == "windows":
+        browser_host = "127.0.0.1" if host == "0.0.0.0" else host
+        try:
+            webbrowser.open(f"http://{browser_host}:{port}/")
+        except webbrowser.Error as exc:
+            print(f"Could not open browser: {exc}", file=sys.stderr)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -1818,7 +2127,47 @@ def parse_job_ids(values: Sequence[str]) -> List[str]:
     return job_ids
 
 
+def load_tracker_settings(tracker_config_path: Path) -> Dict[str, object]:
+    """Read key=value startup settings; key.txt is not an SSH private key."""
+    if not tracker_config_path.exists():
+        return {}
+    tracker_config = configparser.ConfigParser(interpolation=None)
+    tracker_config.read_string(
+        "[tracker]\n" + tracker_config_path.read_text(encoding="utf-8-sig")
+    )
+    tracker_setting_types = {
+        "web": bool, "port": int, "host": str, "backend": str,
+        "ssh_host": str, "ssh_user": str, "ssh_port": int, "ssh_key": str,
+        "user": str, "limit": int, "interval": int, "since_days": int,
+        "db": str,
+    }
+    tracker_settings: Dict[str, object] = {}
+    for tracker_setting_name, tracker_setting_text in tracker_config["tracker"].items():
+        if tracker_setting_name not in tracker_setting_types:
+            raise ValueError(f"Unknown setting in key.txt: {tracker_setting_name}")
+        tracker_setting_type = tracker_setting_types[tracker_setting_name]
+        if tracker_setting_type is bool:
+            tracker_settings[tracker_setting_name] = tracker_config.getboolean(
+                "tracker", tracker_setting_name
+            )
+        elif tracker_setting_name == "ssh_port" and not tracker_setting_text:
+            tracker_settings[tracker_setting_name] = None
+        else:
+            tracker_settings[tracker_setting_name] = tracker_setting_type(tracker_setting_text)
+    if tracker_settings.get("backend", "auto") not in {"auto", "local", "ssh"}:
+        raise ValueError("key.txt backend must be auto, local or ssh")
+    for tracker_path_setting in ("ssh_key", "db"):
+        if tracker_settings.get(tracker_path_setting):
+            tracker_setting_path = Path(str(tracker_settings[tracker_path_setting])).expanduser()
+            if not tracker_setting_path.is_absolute():
+                tracker_setting_path = tracker_config_path.parent / tracker_setting_path
+            tracker_settings[tracker_path_setting] = str(tracker_setting_path)
+    return tracker_settings
+
+
 def build_parser() -> argparse.ArgumentParser:
+    is_windows = platform.system().lower() == "windows"
+    tracker_directory = Path(__file__).resolve().parent
     parser = argparse.ArgumentParser(
         description="Realtime Slurm job tracker with local SQLite history."
     )
@@ -1835,7 +2184,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--ssh-host",
-        default=os.environ.get("SLURM_TRACKER_SSH_HOST", ""),
+        default=os.environ.get(
+            "SLURM_TRACKER_SSH_HOST", "lsr@sycamore.unc.edu" if is_windows else ""
+        ),
         help="Login node hostname for SSH mode. Can also use SLURM_TRACKER_SSH_HOST.",
     )
     parser.add_argument(
@@ -1885,7 +2236,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--db",
-        default="slurm_jobs.sqlite3",
+        default=str(tracker_directory / "slurm_jobs.sqlite3") if is_windows else "slurm_jobs.sqlite3",
         help="Local SQLite database path.",
     )
     parser.add_argument(
@@ -1897,13 +2248,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--limit",
         type=int,
-        default=20,
-        help="Maximum recent jobs to display after active queued/running jobs.",
+        default=200,
+        help="Maximum jobs to display, with queued/running jobs first (default: 200).",
     )
     parser.add_argument(
         "--web",
         action="store_true",
+        default=is_windows,
         help="Run the local browser UI instead of the terminal table.",
+    )
+    parser.add_argument(
+        "--terminal",
+        action="store_false",
+        dest="web",
+        help="Use the terminal table (Windows defaults to the browser UI).",
     )
     parser.add_argument(
         "--host",
@@ -1913,7 +2271,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--port",
         type=int,
-        default=8765,
+        default=0 if is_windows else 8765,
         help="Port for --web. Use 0 to pick a free port.",
     )
     parser.add_argument(
@@ -1936,6 +2294,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Do not clear the terminal between refreshes.",
     )
+    parser.set_defaults(**load_tracker_settings(tracker_directory / "key.txt"))
     return parser
 
 
@@ -1975,13 +2334,22 @@ def resolve_runner(args: argparse.Namespace) -> Tuple[Optional[CommandRunner], O
     if args.backend == "ssh" or (args.backend == "auto" and ssh_host):
         if not ssh_host:
             return None, "--ssh-host is required for SSH backend"
+        ssh_key_path = clean_optional(args.ssh_key)
+        if ssh_key_path:
+            try:
+                ssh_key_file = Path(ssh_key_path).expanduser().resolve()
+                if not ssh_key_file.read_bytes().strip():
+                    return None, f"SSH key file is empty: {ssh_key_file}. Put your SSH private key in this file."
+                ssh_key_path = str(ssh_key_file)
+            except OSError as exc:
+                return None, f"Cannot read SSH key file: {exc}"
         return (
             CommandRunner(
                 backend="ssh",
                 ssh_host=ssh_host,
                 ssh_user=ssh_user,
                 ssh_port=args.ssh_port,
-                ssh_key=clean_optional(args.ssh_key),
+                ssh_key=ssh_key_path,
                 ssh_options=tuple(args.ssh_option or ()),
                 ssh_batch=not args.ssh_no_batch,
                 timeout=args.command_timeout,
@@ -2009,7 +2377,11 @@ def resolve_runner(args: argparse.Namespace) -> Tuple[Optional[CommandRunner], O
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    args = build_parser().parse_args(argv)
+    try:
+        args = build_parser().parse_args(argv)
+    except (OSError, ValueError, configparser.Error) as exc:
+        print(f"Cannot load key.txt configuration: {exc}", file=sys.stderr)
+        return 2
     if args.interval < 1:
         print("--interval must be at least 1 second", file=sys.stderr)
         return 2
@@ -2037,7 +2409,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 2
     args.runner = runner
     db_path = os.path.abspath(args.db)
-    if args.web:
+    if args.web and not args.once:
         return run_web(args, job_ids, db_path)
 
     conn = init_db(db_path)
@@ -2084,4 +2456,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    tracker_exit_code = main()
+    if tracker_exit_code and platform.system().lower() == "windows" and len(sys.argv) == 1:
+        try:
+            input("Press Enter to close...")
+        except EOFError:
+            pass
+    raise SystemExit(tracker_exit_code)
