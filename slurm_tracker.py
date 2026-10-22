@@ -70,6 +70,8 @@ LIGHT_BY_CATEGORY = {
 ANSI_BY_LIGHT = {
     "white": "\033[97m",
     "yellow": "\033[33m",
+    "orange": "\033[38;5;208m",
+    "purple": "\033[35m",
     "green": "\033[32m",
     "red": "\033[31m",
     "gray": "\033[90m",
@@ -125,6 +127,12 @@ class Job:
 
     @property
     def light(self) -> str:
+        if self.category == "queued":
+            pending_reason = self.reason.strip().strip("()").strip().casefold()
+            if pending_reason == "dependencyneversatisfied":
+                return "purple"
+            if pending_reason == "dependency":
+                return "orange"
         return LIGHT_BY_CATEGORY[self.category]
 
 
@@ -1194,6 +1202,8 @@ def light_symbol(light: str, use_color: bool) -> str:
     plain = {
         "white": "W",
         "yellow": "Y",
+        "orange": "O",
+        "purple": "P",
         "green": "G",
         "red": "R",
         "gray": "?",
@@ -1365,6 +1375,8 @@ def render(
         f"{light_symbol('white', use_color)} running  "
         f"{light_symbol('green', use_color)} completed  "
         f"{light_symbol('yellow', use_color)} queued  "
+        f"{light_symbol('orange', use_color)} dependency  "
+        f"{light_symbol('purple', use_color)} dependency never satisfied  "
         f"{light_symbol('red', use_color)} error"
     )
     print(
@@ -1386,8 +1398,8 @@ def render(
         print("Partitions:")
         print(
             f"{'PARTITION':<14} {'AVAIL':<7} {'QUEUED':>6} {'RUN':>5} "
-            f"{'MINE_Q':>6} {'MINE_R':>6} {'JOB_CPUS':>9} "
-            f"{'MY_CPU/CAP':>12} {'POOL A/T':>13} {'LIMIT':>10}"
+            f"{'MINE_Q':>6} {'MINE_R':>6} {'JOB_CORES':>9} "
+            f"{'MY_CORES/CAP':>12} {'POOL A/T':>13} {'LIMIT':>10}"
         )
         print("-" * min(width, 100))
         for part in partitions[:20]:
@@ -1452,6 +1464,8 @@ WEB_HTML = r"""<!doctype html>
   --line: #d8dde3;
   --white-light: #ffffff;
   --yellow-light: #f2c94c;
+  --orange-light: #f28c28;
+  --purple-light: #8b5cf6;
   --green-light: #2fbf71;
   --red-light: #d94b4b;
   --gray-light: #9aa4b2;
@@ -1544,6 +1558,10 @@ h1 {
 }
 .job-light[data-light="yellow"],
 .tiny-light[data-light="yellow"] { background: var(--yellow-light); }
+.job-light[data-light="orange"],
+.tiny-light[data-light="orange"] { background: var(--orange-light); }
+.job-light[data-light="purple"],
+.tiny-light[data-light="purple"] { background: var(--purple-light); }
 .job-light[data-light="green"],
 .tiny-light[data-light="green"] { background: var(--green-light); }
 .job-light[data-light="red"],
@@ -1836,7 +1854,7 @@ h1 {
 </header>
 <main class="wrap">
   <div class="status-line" id="status">Loading Slurm data...</div>
-  <p class="partition-note">One bar per shared node pool; independent partitions have their own bar. Unallocated CPUs may still be constrained. Select a partition for your QoS cap and pending reasons.</p>
+  <p class="partition-note">One bar per shared node pool; independent partitions have their own bar. Unallocated cores may still be constrained. Select a partition for your QoS cap and pending reasons.</p>
   <section class="partition-strip" id="partitions" aria-label="Partitions"></section>
   <section class="light-grid" id="lights" aria-label="Slurm jobs"></section>
 </main>
@@ -1850,7 +1868,7 @@ h1 {
     <button class="close" id="close" type="button" aria-label="Close">&times;</button>
   </div>
   <section class="cpu-chart-section" id="cpu-chart" hidden>
-    <div class="cpu-pie" id="cpu-pie" aria-label="Shared node pool CPU allocation">
+    <div class="cpu-pie" id="cpu-pie" aria-label="Shared node pool core allocation">
       <span class="cpu-pie-total" id="cpu-pie-total"></span>
     </div>
     <div class="cpu-legend" id="cpu-legend"></div>
@@ -1897,10 +1915,10 @@ function percent(value, total) {
 function cpuSlices(partition) {
   if (!partition.cpus_available) return [];
   return [
-    ["Allocated CPUs", Number(partition.cpus_allocated), "var(--cpu-yellow)"],
-    ["Other unallocated CPUs", Number(partition.cpus_idle) - Number(partition.cpus_reserved_idle || 0), "var(--cpu-unallocated)"],
+    ["Allocated cores", Number(partition.cpus_allocated), "var(--cpu-yellow)"],
+    ["Other unallocated cores", Number(partition.cpus_idle) - Number(partition.cpus_reserved_idle || 0), "var(--cpu-unallocated)"],
     ["Idle on reserved nodes", Number(partition.cpus_reserved_idle || 0), "var(--cpu-reserved)"],
-    ["Other CPUs", Number(partition.cpus_other), "var(--cpu-red)"],
+    ["Other cores", Number(partition.cpus_other), "var(--cpu-red)"],
   ];
 }
 
@@ -1930,26 +1948,31 @@ function renderCpuChart(partition) {
       <span class="cpu-label">${escapeHtml(label)}</span>
       <span class="cpu-value">${escapeHtml(value)} (${escapeHtml(percent(value, cpuTotal))})</span>
     </div>
-  `).join("") || "CPU counts unavailable";
+  `).join("") || "core counts unavailable";
   cpuChart.hidden = false;
 }
 
-function renderSummary(data) {
-  if (data.error) {
-    summary.innerHTML = `<span>${escapeHtml(data.backend || "backend unknown")}</span>`;
+function renderSummary(summaryPayload) {
+  if (summaryPayload.error) {
+    summary.innerHTML = `<span>${escapeHtml(summaryPayload.backend || "backend unknown")}</span>`;
     return;
   }
-  const counts = data.counts || {};
-  const items = [
-    ["yellow", counts.queued || 0],
-    ["white", counts.running || 0],
-    ["green", counts.done || 0],
-    ["red", counts.error || 0],
-    ["gray", counts.unknown || 0],
+  const jobLightCounts = {};
+  (summaryPayload.jobs || []).forEach(job => {
+    jobLightCounts[job.light] = (jobLightCounts[job.light] || 0) + 1;
+  });
+  const summaryLights = [
+    ["yellow", "Queued"],
+    ["orange", "Dependency"],
+    ["purple", "DependencyNeverSatisfied"],
+    ["white", "Running"],
+    ["green", "Completed"],
+    ["red", "Error"],
+    ["gray", "Unknown"],
   ];
-  summary.innerHTML = items.map(([light, count]) =>
-    `<span class="count"><span class="tiny-light" data-light="${light}"></span>${count}</span>`
-  ).join("") + `<span>${escapeHtml(data.backend)}</span><span>${escapeHtml(data.updated_at)}</span>`;
+  summary.innerHTML = summaryLights.map(([light, label]) =>
+    `<span class="count" title="${label}"><span class="tiny-light" data-light="${light}"></span>${jobLightCounts[light] || 0}</span>`
+  ).join("") + `<span>${escapeHtml(summaryPayload.backend)}</span><span>${escapeHtml(summaryPayload.updated_at)}</span>`;
 }
 
 function openDetail(job) {
@@ -1996,18 +2019,18 @@ function openPartitionDetail(partition) {
   const partitionFields = [
     ["Availability", partition.availability],
     ["Max Time", partition.max_time],
-    ["Partition Job CPUs", partition.job_cpus_allocated],
-    ["My CPUs in Partition", partition.user_cpus_allocated],
+    ["Partition Job cores", partition.job_cpus_allocated],
+    ["My cores in Partition", partition.user_cpus_allocated],
     ["Partition QoS", partition.partition_qos],
-    ["My CPUs under This QoS", partition.qos_user_cpus_allocated],
-    ["QoS CPU Cap per User", partition.qos_user_cpu_limit],
+    ["My cores under This QoS", partition.qos_user_cpus_allocated],
+    ["QoS core Cap per User", partition.qos_user_cpu_limit],
     ["My Pending Reasons", pendingReasonText],
-    ["QoS Scope", "The CPU cap is per user across partitions with the same partition QoS. Job QoS or account limits may impose additional constraints."],
+    ["QoS Scope", "The core cap is per user across partitions with the same partition QoS. Job QoS or account limits may impose additional constraints."],
     ["Shared Pool Used / Total", partition.cpu_load_text],
     ["Shared Pool Unallocated", partition.cpus_idle],
     ["Idle on Reserved Nodes", partition.cpus_reserved_idle],
     ["Shared Pool Other", partition.cpus_other],
-    ["Scheduling", "The shared pool is not exclusive to this partition. Unallocated CPUs may be reserved or fragmented; memory, priority, QoS and dependencies can prevent a job from starting."],
+    ["Scheduling", "The shared pool is not exclusive to this partition. Unallocated cores may be reserved or fragmented; memory, priority, QoS and dependencies can prevent a job from starting."],
     ["Queue Jobs", partition.jobs_queued],
     ["Running Jobs", partition.jobs_running],
     ["Other Jobs", partition.jobs_other],
@@ -2092,17 +2115,17 @@ function renderPartitions(partitionPayload) {
     const poolTitle = pool.partitions.join(" / ");
     const poolBarLabel = pool.cpus_available
       ? poolSlices.map(([cpuLabel, cpuCount]) => `${cpuLabel}: ${cpuCount}`).join("; ")
-      : "CPU counts unavailable";
+      : "core counts unavailable";
     poolSection.innerHTML = `
       <div class="pool-head">
         <h2 class="pool-title">${escapeHtml(poolTitle)}</h2>
-        <span class="pool-capacity">${pool.partitions.length > 1 ? "Shared pool" : (pool.membership_known ? "Independent partition" : "Partition pool")} · ${escapeHtml(pool.nodes_total)} nodes · ${pool.cpus_available ? escapeHtml(poolTotal) : "-"} CPUs</span>
+        <span class="pool-capacity">${pool.partitions.length > 1 ? "Shared pool" : (pool.membership_known ? "Independent partition" : "Partition pool")} · ${escapeHtml(pool.nodes_total)} nodes · ${pool.cpus_available ? escapeHtml(poolTotal) : "-"} cores</span>
       </div>
       <div class="pool-bar" role="img" aria-label="${escapeHtml(poolBarLabel)}">
-        ${poolSlices.map(([cpuLabel, cpuCount, cpuColor]) => `<span class="pool-bar-segment" style="width: ${poolTotal ? cpuCount / poolTotal * 100 : 0}%; background: ${cpuColor}" title="${escapeHtml(cpuLabel)}: ${escapeHtml(cpuCount)} CPUs (${percent(cpuCount, poolTotal)})"></span>`).join("")}
+        ${poolSlices.map(([cpuLabel, cpuCount, cpuColor]) => `<span class="pool-bar-segment" style="width: ${poolTotal ? cpuCount / poolTotal * 100 : 0}%; background: ${cpuColor}" title="${escapeHtml(cpuLabel)}: ${escapeHtml(cpuCount)} cores (${percent(cpuCount, poolTotal)})"></span>`).join("")}
       </div>
       <div class="pool-legend">
-        ${poolSlices.map(([cpuLabel, cpuCount, cpuColor]) => `<span class="pool-legend-item"><span class="pool-swatch" style="background: ${cpuColor}"></span>${escapeHtml(cpuLabel)} <strong>${escapeHtml(cpuCount)}</strong></span>`).join("") || (pool.cpus_available ? "No CPU capacity" : "CPU counts unavailable")}
+        ${poolSlices.map(([cpuLabel, cpuCount, cpuColor]) => `<span class="pool-legend-item"><span class="pool-swatch" style="background: ${cpuColor}"></span>${escapeHtml(cpuLabel)} <strong>${escapeHtml(cpuCount)}</strong></span>`).join("") || (pool.cpus_available ? "No core capacity" : "core counts unavailable")}
       </div>`;
     const poolButtons = document.createElement("div");
     poolButtons.className = "pool-partitions";
@@ -2113,8 +2136,8 @@ function renderPartitions(partitionPayload) {
       partitionButton.title = `${partition.partition} · state ${text(partition.availability)} · View QoS and pending reasons`;
       partitionButton.innerHTML = `
         <strong>${escapeHtml(partition.partition)}</strong>
-        <span>${escapeHtml(partition.job_cpus_allocated)} job CPUs</span>
-        <span class="partition-personal">${partition.qos_user_cpu_limit == null ? "My CPUs" : "My CPUs / cap"} ${escapeHtml(partition.user_cpu_load_text)} · My queued ${escapeHtml(partition.user_queued)}</span>`;
+        <span>${escapeHtml(partition.job_cpus_allocated)} job cores</span>
+        <span class="partition-personal">${partition.qos_user_cpu_limit == null ? "My cores" : "My cores / cap"} ${escapeHtml(partition.user_cpu_load_text)} · My queued ${escapeHtml(partition.user_queued)}</span>`;
       partitionButton.addEventListener("click", () => openPartitionDetail(partition));
       poolButtons.appendChild(partitionButton);
     });

@@ -6,7 +6,9 @@
 
 - 白灯：运行中，例如 `RUNNING`
 - 绿灯：运行完成，例如 `COMPLETED`
-- 黄灯：排队中，例如 `PENDING`
+- 黄灯：因其他原因排队，例如 `Priority`
+- 橙灯：pending 且等待原因为 `Dependency`
+- 紫灯：pending 且等待原因为 `DependencyNeverSatisfied`
 - 红灯：已结束但报错，例如 `FAILED`、`TIMEOUT`、`CANCELLED`、`OUT_OF_MEMORY`
 
 ## 运行
@@ -45,28 +47,28 @@ http://127.0.0.1:8765/
 
 页面上方按共享节点池显示横向分配条：有共同节点的 partition 合并成一组，独立 partition 各占一条。分组来自 `sinfo -N` 的实际节点归属，部分重叠也会合并，每个物理节点只计数一次；不根据容量相同或 QoS 相同来猜测分组。
 
-条内按不同颜色显示各分区的作业占用、其他已分配 CPU、未分配 CPU、reserved 节点上的 idle 和不可用 CPU。`squeue` 与 `sinfo` 是不同时间的快照，若作业计数暂时超过节点池占用，条内退回显示节点池的总分配量，避免超过实际容量。每条下方保留可点击的分区按钮，显示：
+条内按不同颜色显示各分区的作业占用、其他已分配 core、未分配 core、reserved 节点上的 idle 和不可用 core。`squeue` 与 `sinfo` 是不同时间的快照，若作业计数暂时超过节点池占用，条内退回显示节点池的总分配量，避免超过实际容量。每条下方保留可点击的分区按钮，显示：
 
-- `Partition job CPUs`：通过 `squeue` 汇总实际提交到该 partition 的活动作业占用核数，不包括排队请求和已暂停作业
-- `My CPUs / QoS cap`：你在同一 partition QoS 下的占用核数 / 每用户核数上限；多个 partition 共用 QoS 时合并你的占用。查不到上限时显示 `My CPUs`，仅统计该分区
+- `Partition job cores`：通过 `squeue` 汇总实际提交到该 partition 的活动作业占用核数，不包括排队请求和已暂停作业
+- `My cores / QoS cap`：你在同一 partition QoS 下的占用核数 / 每用户核数上限；多个 partition 共用 QoS 时合并你的占用。查不到上限时显示 `My cores`，仅统计该分区
 - `My queued`：本次查询中你的排队任务数
 - 分区状态在按钮提示及详情中显示；`up` 不保证任务能立即启动
 
-卡片以 `squeue --array` 的逐作业 CPU 分配为准，展开任务数组计数。QoS 名称从 `scontrol show partition -o` 获取，每用户 CPU 上限从 `sacctmgr show qos` 的 `MaxTRESPU` 获取，不硬编码集群上限。作业自身的 QoS 可能是 `normal`，与 partition QoS 不同；其他作业 QoS 或账户限制仍可能生效。查询失败时对应 CPU 数据显示 `-`。
+卡片以 `squeue --array` 的逐作业 core 分配为准，展开任务数组计数。QoS 名称从 `scontrol show partition -o` 获取，每用户 core 上限从 `sacctmgr show qos` 的 `MaxTRESPU` 获取，不硬编码集群上限。作业自身的 QoS 可能是 `normal`，与 partition QoS 不同；其他作业 QoS 或账户限制仍可能生效。查询失败时对应 core 数据显示 `-`。
 
-[UNC Sycamore 分区说明](https://help.rc.unc.edu/sycamore-partitions)中的 `small maxcpu=192` 是**每用户所有作业合计**的上限，不是该分区所有用户总共只有 192 核。例如你已占用 72 核，再启动 128 核作业将达到 200 核，可能因 `QOSMaxCpuPerUserLimit` 等待，即使物理池还有 idle CPU。
+[UNC Sycamore 分区说明](https://help.rc.unc.edu/sycamore-partitions)中的 `small maxcpu=192` 是**每用户所有作业合计**的上限，不是该分区所有用户总共只有 192 核。例如你已占用 72 核，再启动 128 核作业将达到 200 核，可能因 `QOSMaxCpuPerUserLimit` 等待，即使物理池还有 idle core。
 
-详情中的共享节点池统计来自 `sinfo %C`；多个 partition 可以共用节点，池中已分配 CPU 也可能属于其他分区的作业。不能将这些 partition 的容量相加当作集群总容量。CPU 是 Slurm 的调度单位（物理核或硬件线程），不表示实时 CPU 使用率。终端的 `JOB_CPUS` 表示该分区作业占用，`MY_CPU/CAP` 表示你的占用/partition QoS 上限，`POOL A/T` 才是物理节点池已分配/总数。
+详情中的共享节点池统计来自 `sinfo %C`；多个 partition 可以共用节点，池中已分配 core 也可能属于其他分区的作业。不能将这些 partition 的容量相加当作集群总容量。界面统一使用 cores 表示 Slurm 的 CPU 调度单位；Sycamore 每核一个线程，因此这里对应物理核。终端的 `JOB_CORES` 表示该分区作业占用，`MY_CORES/CAP` 表示你的占用/partition QoS 上限，`POOL A/T` 才是物理节点池已分配/总数。
 
-点击任意 partition 摘要会展开 CPU 明细、全局队列数、你的任务数和 `My Pending Reasons`（当前查询返回的等待原因及数量），同时保留 allocated/mixed/down/draining 节点数。等待原因直接来自 `squeue %R`：例如 `Priority` 表示优先级等待，`Dependency` 表示依赖尚未满足。未分配 CPU 可能分散在不同节点或受预留、内存、时限、QoS 等约束；不能仅根据 CPU 总余量判断某个作业能否启动。
+点击任意 partition 摘要会展开 core 明细、全局队列数、你的任务数和 `My Pending Reasons`（当前查询返回的等待原因及数量），同时保留 allocated/mixed/down/draining 节点数。等待原因直接来自 `squeue %R`：例如 `Priority` 表示优先级等待，`Dependency` 表示依赖尚未满足。未分配 core 可能分散在不同节点或受预留、内存、时限、QoS 等约束；不能仅根据 core 总余量判断某个作业能否启动。
 
-partition 详情里会显示共享节点池的 CPU 分配饼图：
+partition 详情里会显示共享节点池的 core 分配饼图：
 
-- 黄色：allocated CPU
-- 蓝色：其他未分配 CPU（仍不保证可调度）
-- 紫色：reserved 状态节点上的未分配 CPU，是总 idle 的子集
-- 红色：other CPU
-- 灰色底图：无 CPU 容量或统计不可用
+- 黄色：allocated core
+- 蓝色：其他未分配 core（仍不保证可调度）
+- 紫色：reserved 状态节点上的未分配 core，是总 idle 的子集
+- 红色：other core
+- 灰色底图：无 core 容量或统计不可用
 
 主页面每组只有一条共享池可视化，不重复展示同一批资源。点击条下的分区按钮查看该分区的饼图、配额和等待原因。
 

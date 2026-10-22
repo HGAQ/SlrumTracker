@@ -6,7 +6,9 @@ Status lights:
 
 - White: running, for example `RUNNING`
 - Green: completed, for example `COMPLETED`
-- Yellow: queued, for example `PENDING`
+- Yellow: queued for other reasons, for example `Priority`
+- Orange: pending with `Dependency`
+- Purple: pending with `DependencyNeverSatisfied`
 - Red: ended with an error, for example `FAILED`, `TIMEOUT`, `CANCELLED`, or `OUT_OF_MEMORY`
 
 ## Run
@@ -45,28 +47,28 @@ The main job view is a grid of status lights. Click a light to open job details.
 
 The top of the page shows one horizontal allocation bar per shared node pool. Partitions with overlapping nodes are grouped together, including partial overlaps; independent partitions each get their own bar. Membership comes from `sinfo -N`, and each physical node is counted once. Equal capacities or equal QoS names do not imply a shared pool.
 
-Colored segments show each partition's job allocation, other allocations, unallocated CPUs, idle CPUs on reserved nodes, and unavailable capacity. Since `squeue` and `sinfo` are separate snapshots, a temporary excess of job CPU counts falls back to a single pool-allocation segment rather than stretching the bar beyond capacity. Clickable partition buttons below each bar retain:
+Colored segments show each partition's job allocation, other allocations, unallocated cores, idle cores on reserved nodes, and unavailable capacity. Since `squeue` and `sinfo` are separate snapshots, a temporary excess of job core counts falls back to a single pool-allocation segment rather than stretching the bar beyond capacity. Clickable partition buttons below each bar retain:
 
-- `Partition job CPUs`: CPUs assigned to active jobs submitted to this partition, from `squeue`; pending requests and suspended jobs are excluded
-- `My CPUs / QoS cap`: your allocation across partitions sharing the partition QoS / its per-user CPU cap. Without a reported cap, `My CPUs` shows your allocation in this partition
+- `Partition job cores`: cores assigned to active jobs submitted to this partition, from `squeue`; pending requests and suspended jobs are excluded
+- `My cores / QoS cap`: your allocation across partitions sharing the partition QoS / its per-user core cap. Without a reported cap, `My cores` shows your allocation in this partition
 - `My queued`: your pending jobs in the current query
 - Partition state is available in the button tooltip and details; `up` does not guarantee that a job can start
 
-Cards use per-job allocations from `squeue --array`, expanding job arrays for counting. Partition QoS is read from `scontrol show partition -o`, and its per-user CPU cap comes from `sacctmgr show qos` (`MaxTRESPU`), without hardcoded cluster limits. A job's own QoS may be `normal` while a partition QoS also applies. Job QoS and account limits can impose additional constraints. Failed CPU queries display as `-`.
+Cards use per-job allocations from `squeue --array`, expanding job arrays for counting. Partition QoS is read from `scontrol show partition -o`, and its per-user core cap comes from `sacctmgr show qos` (`MaxTRESPU`), without hardcoded cluster limits. A job's own QoS may be `normal` while a partition QoS also applies. Job QoS and account limits can impose additional constraints. Failed core queries display as `-`.
 
-The [UNC Sycamore partition guide](https://help.rc.unc.edu/sycamore-partitions) defines `small maxcpu=192` as the sum across one user's jobs, not the total CPU capacity for all users in the partition. For example, using 72 CPUs and requesting another 128 exceeds that cap (200 > 192), so a job may wait with `QOSMaxCpuPerUserLimit` despite idle CPUs in the shared node pool.
+The [UNC Sycamore partition guide](https://help.rc.unc.edu/sycamore-partitions) defines `small maxcpu=192` as the sum across one user's jobs, not the total core capacity for all users in the partition. For example, using 72 cores and requesting another 128 exceeds that cap (200 > 192), so a job may wait with `QOSMaxCpuPerUserLimit` despite idle cores in the shared node pool.
 
-The details' shared node pool comes from `sinfo %C`. It may include allocations by jobs submitted to other partitions. Partitions sharing nodes do not have independent capacities, so their pool totals must not be added together. A CPU is Slurm's configured core/thread scheduling unit, not live CPU utilization. Terminal columns distinguish `JOB_CPUS` (partition jobs), `MY_CPU/CAP` (your usage / partition QoS cap), and `POOL A/T` (shared pool allocated / total).
+The details' shared node pool comes from `sinfo %C`. It may include allocations by jobs submitted to other partitions. Partitions sharing nodes do not have independent capacities, so their pool totals must not be added together. The interface uses “cores” for Slurm's CPU scheduling units; this matches physical cores on Sycamore (one thread per core). Terminal columns distinguish `JOB_CORES` (partition jobs), `MY_CORES/CAP` (your usage / partition QoS cap), and `POOL A/T` (shared pool allocated / total).
 
-Each group shows shared capacity only once. Click a partition button for its pool pie chart, full CPU/node counts, and global/personal job counts. `My Pending Reasons` groups the current query's pending jobs by `squeue %R`, such as `Priority` or `Dependency`. Unallocated CPUs can be constrained by fragmentation, memory, reservations, time limits, QoS, priority, or dependencies. Spare totals alone cannot establish whether a job can start.
+Each group shows shared capacity only once. Click a partition button for its pool pie chart, full core/node counts, and global/personal job counts. `My Pending Reasons` groups the current query's pending jobs by `squeue %R`, such as `Priority` or `Dependency`. Unallocated cores can be constrained by fragmentation, memory, reservations, time limits, QoS, priority, or dependencies. Spare totals alone cannot establish whether a job can start.
 
-CPU-allocation colors:
+core-allocation colors:
 
-- Yellow: allocated CPUs
-- Blue: other unallocated CPUs (not guaranteed schedulable)
-- Purple: idle CPUs on reserved nodes, a subset of total idle CPUs
-- Red: other CPUs
-- Gray background: no CPU capacity or unavailable counts
+- Yellow: allocated cores
+- Blue: other unallocated cores (not guaranteed schedulable)
+- Purple: idle cores on reserved nodes, a subset of total idle cores
+- Red: other cores
+- Gray background: no core capacity or unavailable counts
 
 ## Configuration and direct startup
 

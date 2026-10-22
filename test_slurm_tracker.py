@@ -95,7 +95,7 @@ class PartitionCpuTests(unittest.TestCase):
         with contextlib.redirect_stdout(terminal_output):
             tracker.render([], list(partition_summaries.values()), parse_warnings,
                            ":memory:", "test", 10, False, False)
-        self.assertIn("JOB_CPUS", terminal_output.getvalue())
+        self.assertIn("JOB_CORES", terminal_output.getvalue())
         self.assertIn("POOL A/T", terminal_output.getvalue())
         self.assertIn("8/32", terminal_output.getvalue())
 
@@ -218,6 +218,28 @@ class PartitionCpuTests(unittest.TestCase):
                 )
                 self.assertIsNone(partition_summaries[0].job_cpus_allocated)
                 self.assertEqual(partition_summaries[0].user_cpu_load_text, "-")
+
+
+class JobDependencyLightTests(unittest.TestCase):
+    def test_pending_dependency_colors_preserve_queued_category(self):
+        for pending_reason, expected_light in (
+            ("Dependency", "orange"), (" (Dependency) ", "orange"),
+            ("DependencyNeverSatisfied", "purple"),
+            ("(dependencyneversatisfied)", "purple"),
+            ("(Priority)", "yellow"), ("", "yellow"),
+        ):
+            with self.subTest(pending_reason=pending_reason):
+                pending_job = tracker.Job("1", "PENDING", reason=pending_reason)
+                self.assertEqual(pending_job.category, "queued")
+                self.assertEqual(tracker.job_to_dict(pending_job)["light"], expected_light)
+                self.assertEqual(tracker.count_jobs([pending_job])["queued"], 1)
+                self.assertNotEqual(tracker.light_symbol(expected_light, False), "?")
+
+    def test_stale_dependency_reason_does_not_recolor_non_pending_jobs(self):
+        for job_state, expected_light in (("RUNNING", "white"), ("COMPLETED", "green"), ("FAILED", "red")):
+            with self.subTest(job_state=job_state):
+                dependency_job = tracker.Job("1", job_state, reason="DependencyNeverSatisfied")
+                self.assertEqual(dependency_job.light, expected_light)
 
 
 class PartitionPoolTests(unittest.TestCase):
