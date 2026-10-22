@@ -13,6 +13,7 @@ import re
 import shlex
 import shutil
 import signal
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -24,7 +25,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 
 DELIM = "\x1f"
@@ -120,6 +121,10 @@ class Job:
     first_seen: str = ""
     last_seen: str = ""
     source: str = ""
+    cores: str = ""
+    memory: str = ""
+    memory_kind: str = ""
+    work_dir: str = ""
 
     @property
     def category(self) -> str:
@@ -440,7 +445,7 @@ def split_row(line: str, expected_fields: int) -> Optional[List[str]]:
 
 
 def build_squeue_jobs_args(user: str, job_ids: Sequence[str]) -> List[str]:
-    fmt = DELIM.join(["%i", "%T", "%j", "%P", "%M", "%l", "%D", "%R"])
+    fmt = DELIM.join(["%i", "%T", "%j", "%P", "%M", "%l", "%D", "%R", "%C", "%m", "%Z", "%S"])
     args = ["squeue", "-h", "--array", "-o", fmt]
     if user:
         args.extend(["--user", user])
@@ -456,12 +461,13 @@ def parse_squeue_jobs_output(output: str, user: str) -> Tuple[Dict[str, Job], Li
     for line in output.splitlines():
         if not line.strip():
             continue
-        fields = split_row(line, 8)
+        fields = split_row(line, 12) or split_row(line, 8)
         if fields is None:
             if DELIM in line:
                 warnings.append(f"could not parse squeue row: {line!r}")
             continue
-        job_id, state, job_name, partition, elapsed, time_limit, nodes, reason = fields
+        job_id, state, job_name, partition, elapsed, time_limit, nodes, reason = fields[:8]
+        cores, memory, work_dir, start_time = fields[8:] if len(fields) == 12 else ("", "", "", "")
         jobs[job_id] = Job(
             job_id=job_id,
             state=clean_state(state),
@@ -473,6 +479,11 @@ def parse_squeue_jobs_output(output: str, user: str) -> Tuple[Dict[str, Job], Li
             nodes=nodes,
             reason=clean_optional(reason),
             source="squeue",
+            cores=cores,
+            memory=clean_optional(memory),
+            memory_kind="requested minimum" if clean_optional(memory) else "",
+            work_dir=clean_optional(work_dir),
+            start_time=clean_optional(start_time) if category_for_state(state) != "queued" else "",
         )
 
     return jobs, warnings
@@ -508,6 +519,11 @@ def build_sacct_jobs_args(
         "Reason",
         "Start",
         "End",
+        "AllocCPUS",
+        "ReqCPUS",
+        "AllocTRES",
+        "ReqTRES",
+        "WorkDir%4096",
     ]
     args = [
         "sacct",
@@ -528,13 +544,12 @@ def build_sacct_jobs_args(
 
 def parse_sacct_jobs_output(output: str, user: str) -> Tuple[Dict[str, Job], List[str]]:
     warnings: List[str] = []
-    fields_count = 12
     jobs: Dict[str, Job] = {}
 
     for line in output.splitlines():
         if not line.strip():
             continue
-        row = split_row(line, fields_count)
+        row = split_row(line, 17) or split_row(line, 12)
         if row is None:
             if DELIM in line:
                 warnings.append(f"could not parse sacct row: {line!r}")
@@ -552,7 +567,13 @@ def parse_sacct_jobs_output(output: str, user: str) -> Tuple[Dict[str, Job], Lis
             reason,
             start_time,
             end_time,
-        ) = row
+        ) = row[:12]
+        allocated_cores, requested_cores, allocated_tres, requested_tres, work_dir = (
+            row[12:] if len(row) == 17 else ("", "", "", "", "")
+        )
+        allocated_memory = tres_memory(allocated_tres)
+        requested_memory = tres_memory(requested_tres)
+        job_cores = allocated_cores if parse_int(allocated_cores) > 0 else requested_cores
         jobs[job_id] = Job(
             job_id=job_id,
             state=clean_state(state),
@@ -564,12 +585,23 @@ def parse_sacct_jobs_output(output: str, user: str) -> Tuple[Dict[str, Job], Lis
             nodes=nodes,
             reason=clean_optional(reason),
             exit_code=exit_code,
-            start_time=start_time,
-            end_time=end_time,
+            start_time=clean_optional(start_time) if category_for_state(state) != "queued" else "",
+            end_time=clean_optional(end_time) if category_for_state(state) not in {"queued", "running"} else "",
             source="sacct",
+            cores=job_cores,
+            memory=allocated_memory or requested_memory,
+            memory_kind="allocated" if allocated_memory else ("requested" if requested_memory else ""),
+            work_dir=clean_optional(work_dir),
         )
 
     return jobs, warnings
+
+
+def tres_memory(job_tres: str) -> str:
+    for job_resource in job_tres.split(","):
+        if job_resource.strip().startswith("mem="):
+            return clean_optional(job_resource.strip().split("=", 1)[1])
+    return ""
 
 
 def load_sacct_jobs(
@@ -797,6 +829,10 @@ def init_db(path: str) -> sqlite3.Connection:
         )
         """
     )
+    job_columns = {job_column[1] for job_column in conn.execute("PRAGMA table_info(jobs)")}
+    for metadata_column in ("cores", "memory", "memory_kind", "work_dir"):
+        if metadata_column not in job_columns:
+            conn.execute(f"ALTER TABLE jobs ADD COLUMN {metadata_column} TEXT NOT NULL DEFAULT ''")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS events (
@@ -822,9 +858,17 @@ def record_jobs(conn: sqlite3.Connection, jobs: Iterable[Job]) -> None:
     seen_at = now_iso()
     for job in jobs:
         previous = conn.execute(
-            "SELECT state, light, first_seen FROM jobs WHERE job_id = ?",
+            "SELECT state, light, first_seen, cores, memory, memory_kind, work_dir FROM jobs WHERE job_id = ?",
             (job.job_id,),
         ).fetchone()
+        job.first_seen = previous[2] if previous is not None else seen_at
+        job.last_seen = seen_at
+        if previous is not None:
+            for metadata_name, previous_text in zip(
+                ("cores", "memory", "memory_kind", "work_dir"), previous[3:],
+            ):
+                if not getattr(job, metadata_name):
+                    setattr(job, metadata_name, previous_text or "")
         if previous is None:
             first_seen = seen_at
             conn.execute(
@@ -832,9 +876,9 @@ def record_jobs(conn: sqlite3.Connection, jobs: Iterable[Job]) -> None:
                 INSERT INTO jobs (
                     job_id, job_name, user, partition, state, category, light,
                     elapsed, time_limit, nodes, reason, exit_code, start_time,
-                    end_time, first_seen, last_seen, source
+                    end_time, first_seen, last_seen, source, cores, memory, memory_kind, work_dir
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job.job_id,
@@ -854,6 +898,10 @@ def record_jobs(conn: sqlite3.Connection, jobs: Iterable[Job]) -> None:
                     first_seen,
                     seen_at,
                     job.source,
+                    job.cores,
+                    job.memory,
+                    job.memory_kind,
+                    job.work_dir,
                 ),
             )
             conn.execute(
@@ -868,7 +916,7 @@ def record_jobs(conn: sqlite3.Connection, jobs: Iterable[Job]) -> None:
             )
             continue
 
-        old_state, old_light, first_seen = previous
+        old_state, old_light, first_seen = previous[:3]
         if old_state != job.state or old_light != job.light:
             conn.execute(
                 """
@@ -895,7 +943,7 @@ def record_jobs(conn: sqlite3.Connection, jobs: Iterable[Job]) -> None:
             SET job_name = ?, user = ?, partition = ?, state = ?, category = ?,
                 light = ?, elapsed = ?, time_limit = ?, nodes = ?, reason = ?,
                 exit_code = ?, start_time = ?, end_time = ?, first_seen = ?,
-                last_seen = ?, source = ?
+                last_seen = ?, source = ?, cores = ?, memory = ?, memory_kind = ?, work_dir = ?
             WHERE job_id = ?
             """,
             (
@@ -915,6 +963,10 @@ def record_jobs(conn: sqlite3.Connection, jobs: Iterable[Job]) -> None:
                 first_seen,
                 seen_at,
                 job.source,
+                job.cores,
+                job.memory,
+                job.memory_kind,
+                job.work_dir,
                 job.job_id,
             ),
         )
@@ -939,7 +991,7 @@ def load_recorded_jobs(
         f"""
         SELECT job_id, state, job_name, user, partition, elapsed, time_limit,
                nodes, reason, exit_code, start_time, end_time, first_seen,
-               last_seen, source
+               last_seen, source, cores, memory, memory_kind, work_dir
         FROM jobs
         {where}
         ORDER BY
@@ -967,6 +1019,10 @@ def load_recorded_jobs(
             first_seen=row[12] or "",
             last_seen=row[13] or "",
             source=row[14] or "db",
+            cores=row[15] or "",
+            memory=row[16] or "",
+            memory_kind=row[17] or "",
+            work_dir=row[18] or "",
         )
         for row in rows
     ]
@@ -988,6 +1044,16 @@ def choose_display_jobs(
 
 def combine_jobs(active: Dict[str, Job], accounted: Dict[str, Job]) -> Dict[str, Job]:
     combined = dict(accounted)
+    for job_id, active_job in active.items():
+        accounted_job = accounted.get(job_id)
+        if accounted_job is None:
+            continue
+        for metadata_name in ("cores", "work_dir", "start_time"):
+            if not getattr(active_job, metadata_name):
+                setattr(active_job, metadata_name, getattr(accounted_job, metadata_name))
+        if accounted_job.memory:
+            active_job.memory = accounted_job.memory
+            active_job.memory_kind = accounted_job.memory_kind
     combined.update(active)
     return combined
 
@@ -1223,7 +1289,13 @@ def info_for_job(job: Job) -> str:
     return info
 
 
-def job_to_dict(job: Job) -> Dict[str, str]:
+def job_folder_url(work_dir: str, ssh_target: str) -> str:
+    if not ssh_target or not work_dir.startswith("/") or any(ord(character) < 32 for character in work_dir):
+        return ""
+    return "vscode://vscode-remote/ssh-remote+" + quote(ssh_target, safe="@") + quote(work_dir, safe="/")
+
+
+def job_to_dict(job: Job, folder_ssh_target: str = "") -> Dict[str, str]:
     return {
         "job_id": job.job_id,
         "state": job.state,
@@ -1243,6 +1315,11 @@ def job_to_dict(job: Job) -> Dict[str, str]:
         "last_seen": job.last_seen,
         "source": job.source,
         "info": info_for_job(job),
+        "cores": job.cores,
+        "memory": job.memory,
+        "memory_kind": job.memory_kind,
+        "work_dir": job.work_dir,
+        "folder_url": job_folder_url(job.work_dir, folder_ssh_target),
     }
 
 
@@ -1687,12 +1764,39 @@ h1 {
   position: fixed;
   top: 0;
   right: 0;
-  width: min(430px, calc(100vw - 28px));
+  width: min(510px, calc(100vw - 28px));
   height: 100vh;
   overflow: auto;
   border-left: 1px solid var(--line);
   background: var(--panel);
   box-shadow: -12px 0 30px rgba(31, 41, 51, 0.16);
+}
+.detail[data-light="orange"] { background: #fff4e8; }
+.detail[data-light="purple"] { background: #f4efff; }
+.detail[data-light="yellow"] { background: #fffbea; }
+.detail[data-light="green"] { background: #edf8f0; }
+.detail[data-light="red"] { background: #fff0f0; }
+.detail[data-light="white"] { background: #f4f7fa; }
+.detail[data-light="gray"] { background: #f1f3f5; }
+.job-folder-path {
+  display: block;
+  margin-bottom: 10px;
+  overflow-wrap: anywhere;
+  font-family: ui-monospace, monospace;
+  font-size: 12px;
+}
+.folder-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.folder-action {
+  display: inline-block;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.65);
+  color: var(--ink);
+  padding: 7px 10px;
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+  text-decoration: none;
 }
 .detail-head {
   display: flex;
@@ -1952,6 +2056,38 @@ function renderCpuChart(partition) {
   cpuChart.hidden = false;
 }
 
+function formatTimestamp(timestamp) {
+  const timestampText = text(timestamp);
+  const timestampMatch = timestampText.match(/^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})/);
+  return timestampMatch ? `${timestampMatch[1]} ${timestampMatch[2]}` : "-";
+}
+
+function formatTimeRange(firstTimestamp, lastTimestamp) {
+  const firstTime = formatTimestamp(firstTimestamp);
+  let lastTime = formatTimestamp(lastTimestamp);
+  if (firstTime === "-" && lastTime === "-") return "-";
+  if (firstTime !== "-" && firstTime.slice(0, 10) === lastTime.slice(0, 10)) lastTime = lastTime.slice(11);
+  return `${firstTime} → ${lastTime}`;
+}
+
+function formatDuration(duration) {
+  const durationText = text(duration);
+  if (durationText.toUpperCase() === "UNLIMITED") return "unlimited";
+  const durationMatch = durationText.match(/^(?:(\d+)-)?(\d+):(\d+)(?::(\d+))?$/);
+  if (!durationMatch) return durationText;
+  const hasHours = durationMatch[1] !== undefined || durationMatch[4] !== undefined;
+  let durationSeconds = Number(durationMatch[1] || 0) * 86400
+    + (hasHours ? Number(durationMatch[2]) * 3600 + Number(durationMatch[3]) * 60 + Number(durationMatch[4] || 0)
+                : Number(durationMatch[2]) * 60 + Number(durationMatch[3]));
+  const durationParts = [];
+  for (const [unitSeconds, unitLabel] of [[86400, "day"], [3600, "h"], [60, "m"], [1, "s"]]) {
+    const unitCount = Math.floor(durationSeconds / unitSeconds);
+    durationSeconds %= unitSeconds;
+    if (unitCount) durationParts.push(`${unitCount}${unitLabel === "day" && unitCount > 1 ? "days" : unitLabel}`);
+  }
+  return durationParts.join(" ") || "0s";
+}
+
 function renderSummary(summaryPayload) {
   if (summaryPayload.error) {
     summary.innerHTML = `<span>${escapeHtml(summaryPayload.backend || "backend unknown")}</span>`;
@@ -1972,39 +2108,53 @@ function renderSummary(summaryPayload) {
   ];
   summary.innerHTML = summaryLights.map(([light, label]) =>
     `<span class="count" title="${label}"><span class="tiny-light" data-light="${light}"></span>${jobLightCounts[light] || 0}</span>`
-  ).join("") + `<span>${escapeHtml(summaryPayload.backend)}</span><span>${escapeHtml(summaryPayload.updated_at)}</span>`;
+  ).join("") + `<span>${escapeHtml(summaryPayload.backend)}</span><span>${escapeHtml(formatTimestamp(summaryPayload.updated_at))}</span>`;
 }
 
 function openDetail(job) {
   selectedJobId = job.job_id;
   selectedPartitionName = null;
   cpuChart.hidden = true;
+  detail.dataset.light = job.light || "gray";
   detailTitle.textContent = `${job.job_id}  ${job.state}`;
   detailSubtitle.textContent = job.job_name || job.partition || "";
-  const fields = [
-    ["Light", job.light],
-    ["State", job.state],
-    ["Name", job.job_name],
+  const resourceText = `${text(job.nodes)} nodes · ${text(job.cores)} cores`;
+  const memoryText = job.memory ? `${job.memory} (${job.memory_kind || "reported"})` : "-";
+  const jobFields = [
     ["Partition", job.partition],
-    ["Elapsed", job.elapsed],
-    ["Limit", job.time_limit],
-    ["Nodes", job.nodes],
+    ["Elapsed / limit", `${formatDuration(job.elapsed)}/${formatDuration(job.time_limit)}`],
+    ["Resources", resourceText],
+    ["Memory", memoryText],
     ["Info", job.info],
     ["Exit", job.exit_code],
-    ["Start", job.start_time],
-    ["End", job.end_time],
-    ["First Seen", job.first_seen],
-    ["Last Seen", job.last_seen],
-    ["Source", job.source],
+    ["Start → end", formatTimeRange(job.start_time, job.end_time)],
+    ["First → last seen", formatTimeRange(job.first_seen, job.last_seen)],
   ];
-  details.innerHTML = fields.map(([key, value]) =>
+  details.innerHTML = jobFields.map(([key, value]) =>
     `<dt>${escapeHtml(key)}</dt><dd>${escapeHtml(value)}</dd>`
   ).join("");
+  if (job.work_dir) {
+    const folderLink = job.folder_url && job.folder_url.startsWith("vscode://vscode-remote/ssh-remote+")
+      ? `<a class="folder-action" href="${escapeHtml(job.folder_url)}">Open in VS Code</a>` : "";
+    details.innerHTML += `<dt>Folder</dt><dd><span class="job-folder-path">${escapeHtml(job.work_dir)}</span><div class="folder-actions">${folderLink}<button class="folder-action" id="copy-job-folder" type="button">Copy path</button></div></dd>`;
+    document.getElementById("copy-job-folder").addEventListener("click", async event => {
+      const copyButton = event.currentTarget;
+      try {
+        await navigator.clipboard.writeText(job.work_dir);
+        copyButton.textContent = "Copied";
+      } catch (copyError) {
+        copyButton.textContent = "Select the path above to copy";
+      }
+    });
+  } else {
+    details.innerHTML += "<dt>Folder</dt><dd>Not reported by Slurm</dd>";
+  }
   detail.hidden = false;
   backdrop.hidden = false;
 }
 
 function openPartitionDetail(partition) {
+  delete detail.dataset.light;
   selectedJobId = null;
   selectedPartitionName = partition.partition;
   const downTotal = Number(partition.nodes_down || 0) + Number(partition.nodes_draining || 0);
@@ -2200,6 +2350,7 @@ class TrackerConfig:
     no_sacct: bool
     limit: int
     interval: int
+    folder_ssh_target: str = ""
 
 
 class TrackerHTTPServer(ThreadingHTTPServer):
@@ -2302,7 +2453,7 @@ class TrackerRequestHandler(BaseHTTPRequestHandler):
                 "warnings": warnings,
                 "partitions": [partition_to_dict(part) for part in partitions],
                 "partition_pools": build_partition_pool_summaries(partitions),
-                "jobs": [job_to_dict(job) for job in jobs],
+                "jobs": [job_to_dict(job, config.folder_ssh_target) for job in jobs],
             }
         )
 
@@ -2320,6 +2471,10 @@ def run_web(args: argparse.Namespace, job_ids: List[str], db_path: str) -> int:
         no_sacct=args.no_sacct,
         limit=args.limit,
         interval=args.interval,
+        folder_ssh_target=(args.folder_ssh_host or (
+            args.runner.ssh_target if args.runner.backend == "ssh"
+            else (args.ssh_host or socket.getfqdn())
+        )),
     )
     try:
         server = TrackerHTTPServer((args.host, args.port), TrackerRequestHandler, config)
@@ -2384,7 +2539,7 @@ def load_tracker_settings(tracker_config_path: Path) -> Dict[str, object]:
         "web": bool, "port": int, "host": str, "backend": str,
         "ssh_host": str, "ssh_user": str, "ssh_port": int, "ssh_key": str,
         "user": str, "limit": int, "interval": int, "since_days": int,
-        "db": str,
+        "db": str, "folder_ssh_host": str,
     }
     tracker_settings: Dict[str, object] = {}
     for tracker_setting_name, tracker_setting_text in tracker_config["tracker"].items():
@@ -2438,6 +2593,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--ssh-user",
         default=os.environ.get("SLURM_TRACKER_SSH_USER", ""),
         help="SSH username for the login node. Defaults to the Slurm user.",
+    )
+    parser.add_argument(
+        "--folder-ssh-host",
+        default="",
+        help="VS Code Remote SSH host or SSH config alias for job folder links; defaults to the query host.",
     )
     parser.add_argument(
         "--ssh-port",

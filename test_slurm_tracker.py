@@ -2,7 +2,10 @@
 
 import contextlib
 import io
+import sqlite3
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import slurm_tracker as tracker
@@ -218,6 +221,61 @@ class PartitionCpuTests(unittest.TestCase):
                 )
                 self.assertIsNone(partition_summaries[0].job_cpus_allocated)
                 self.assertEqual(partition_summaries[0].user_cpu_load_text, "-")
+
+
+class JobMetadataTests(unittest.TestCase):
+    def test_live_job_fields_and_pending_start_estimate(self):
+        queue_fields = ["123", "PENDING", "test", "small", "0:00", "3-00:00:00",
+                        "6", "(Dependency)", "192", "1200G", "/work/test folder", "2026-10-25T12:00:00"]
+        queue_jobs, parse_warnings = tracker.parse_squeue_jobs_output(tracker.DELIM.join(queue_fields), "tester")
+        self.assertEqual(parse_warnings, [])
+        self.assertEqual(queue_jobs["123"].cores, "192")
+        self.assertEqual(queue_jobs["123"].work_dir, "/work/test folder")
+        self.assertEqual(queue_jobs["123"].memory_kind, "requested minimum")
+        self.assertEqual(queue_jobs["123"].start_time, "")
+
+    def test_accounting_memory_and_active_merge(self):
+        accounting_fields = ["123", "test", "tester", "batch", "RUNNING", "01:00:00", "3-00:00:00",
+                             "6", "0:0", "None", "2026-10-22T08:00:00", "Unknown",
+                             "192", "192", "cpu=192,mem=7200G,node=6", "cpu=192,mem=7200G,node=6", "/work/test"]
+        accounting_jobs, parse_warnings = tracker.parse_sacct_jobs_output(tracker.DELIM.join(accounting_fields), "tester")
+        self.assertEqual(parse_warnings, [])
+        active_jobs = {"123": tracker.Job("123", "RUNNING", cores="192", memory="1200G", memory_kind="requested minimum")}
+        merged_jobs = tracker.combine_jobs(active_jobs, accounting_jobs)
+        self.assertEqual(merged_jobs["123"].memory, "7200G")
+        self.assertEqual(merged_jobs["123"].memory_kind, "allocated")
+        self.assertEqual(active_jobs["123"].work_dir, "/work/test")
+        self.assertEqual(active_jobs["123"].start_time, "2026-10-22T08:00:00")
+        self.assertEqual(active_jobs["123"].end_time, "")
+
+    def test_legacy_database_upgrade_and_metadata_preservation(self):
+        with tempfile.TemporaryDirectory() as tracker_test_directory:
+            tracker_db_path = str(Path(tracker_test_directory) / "old.sqlite3")
+            legacy_columns = ["job_name", "user", "partition", "state", "category", "light", "elapsed",
+                              "time_limit", "nodes", "reason", "exit_code", "start_time", "end_time",
+                              "first_seen", "last_seen", "source"]
+            with sqlite3.connect(tracker_db_path) as legacy_database:
+                legacy_database.execute("CREATE TABLE jobs (job_id TEXT PRIMARY KEY, " +
+                                        ", ".join(column + " TEXT DEFAULT ''" for column in legacy_columns) + ")")
+                legacy_database.execute("INSERT INTO jobs (job_id,state,light,first_seen) VALUES ('123','PENDING','yellow','2026-10-21T10:00:00-04:00')")
+            with tracker.init_db(tracker_db_path) as tracker_database:
+                active_job = tracker.Job("123", "RUNNING", cores="192", memory="7200G", memory_kind="allocated", work_dir="/work/test")
+                tracker.record_jobs(tracker_database, [active_job])
+                self.assertEqual(active_job.first_seen, "2026-10-21T10:00:00-04:00")
+                self.assertTrue(active_job.last_seen)
+                tracker.record_jobs(tracker_database, [tracker.Job("123", "COMPLETED")])
+                historical_job = tracker.load_recorded_jobs(tracker_database, 1)[0]
+                self.assertEqual(historical_job.state, "COMPLETED")
+                self.assertEqual(historical_job.work_dir, "/work/test")
+                self.assertEqual(historical_job.cores, "192")
+                self.assertEqual(historical_job.memory, "7200G")
+
+    def test_folder_links_encode_paths_and_reject_missing_directories(self):
+        self.assertEqual(tracker.job_folder_url('/work/a b/#x?"', "tester@login"),
+                         "vscode://vscode-remote/ssh-remote+tester@login/work/a%20b/%23x%3F%22")
+        self.assertEqual(tracker.job_folder_url("relative/path", "login"), "")
+        self.assertEqual(tracker.job_folder_url("/work/test\n", "login"), "")
+        self.assertEqual(tracker.job_folder_url("/work/test", ""), "")
 
 
 class JobDependencyLightTests(unittest.TestCase):

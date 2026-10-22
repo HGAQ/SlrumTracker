@@ -45,6 +45,10 @@ http://127.0.0.1:8765/
 
 主界面只显示任务状态灯，点击某个灯会显示该任务详情。
 
+任务详情按状态灯使用浅色背景，标题保留任务编号、状态和名称，省去重复的 Light、Name、Source 行。运行时长与时限合并为 `0s/3days` 这样的形式，显示 nodes、cores 以及内存（标注已分配、申请值或最低申请值，不是实时 RSS）。开始/结束、首次/最近观察各合并为一行；详情和右上角时间均显示 `2026-10-22 17:11:14`，隐藏时区后缀并保留原时间值。
+
+目录来自 Slurm 的工作目录记录，详情提供 **Open in VS Code** 和 **Copy path**。前者通过 VS Code Remote SSH 打开远程目录，需要本机安装 VS Code 与 Remote SSH 扩展，并配置好 SSH 登录。默认使用监控连接的 SSH 主机，可通过 `--folder-ssh-host YOUR_SSH_ALIAS` 或本地配置项 `folder_ssh_host` 指定 VS Code 使用的 SSH 别名。旧数据库自动补充资源和目录字段，原历史记录保留；Slurm 未提供目录时显示缺失提示。
+
 页面上方按共享节点池显示横向分配条：有共同节点的 partition 合并成一组，独立 partition 各占一条。分组来自 `sinfo -N` 的实际节点归属，部分重叠也会合并，每个物理节点只计数一次；不根据容量相同或 QoS 相同来猜测分组。
 
 条内按不同颜色显示各分区的作业占用、其他已分配 core、未分配 core、reserved 节点上的 idle 和不可用 core。`squeue` 与 `sinfo` 是不同时间的快照，若作业计数暂时超过节点池占用，条内退回显示节点池的总分配量，避免超过实际容量。每条下方保留可点击的分区按钮，显示：
@@ -79,15 +83,12 @@ partition 详情里会显示共享节点池的 core 分配饼图：
 ```ini
 web = true
 port = 0
-ssh_host = sycamore.unc.edu
-ssh_user = lsr
-user = lsr
 limit = 200
 interval = 10
 ssh_key =
 ```
 
-直接运行 `python slurm_tracker.py` 即相当于原来的 `python slurm_tracker.py --web --port 0 --ssh-host sycamore.unc.edu --ssh-user lsr --user lsr`。Windows 安装 Python 并关联 `.py` 后，也可双击启动并自动打开浏览器；需要 Windows OpenSSH。
+直接运行 `python slurm_tracker.py` 会读取你的本地配置；SSH 主机和用户名请填写自己的连接信息或通过命令行指定。Windows 安装 Python 并关联 `.py` 后，也可双击启动并自动打开浏览器；需要 Windows OpenSSH。
 
 `key.txt` 存放配置，不存放私钥内容。`ssh_key` 留空时沿用 SSH 默认密钥或 agent；如需指定私钥，在这一项填写私钥文件路径。配置中的相对路径以脚本目录为基准。首次连接前通过终端 SSH 确认主机指纹，加密私钥需预先加载到 SSH agent。
 
@@ -122,13 +123,13 @@ python slurm_tracker.py --web --port 0 --ssh-host your_user@login-node.example.e
 UNC Sycamore 示例：
 
 ```powershell
-python slurm_tracker.py --web --port 0 --ssh-host sycamore.unc.edu --ssh-user lsr --user lsr
+python slurm_tracker.py --web --port 0 --ssh-host sycamore.unc.edu --ssh-user your_user --user your_user
 ```
 
 或者：
 
 ```powershell
-python slurm_tracker.py --web --port 0 --ssh-host lsr@sycamore.unc.edu --user lsr
+python slurm_tracker.py --web --port 0 --ssh-host your_user@sycamore.unc.edu --user your_user
 ```
 
 不要把主机写成 `sycamore@unc.edu`；那会被解析成错误的 `user@host` 形式。
@@ -153,7 +154,7 @@ python slurm_tracker.py --web --ssh-host login-node.example.edu --ssh-user your_
 SSH 模式下，每次刷新只会建立一个 SSH 连接，并在登录节点上执行作业、节点和 QoS 查询（`squeue`、`sacct`、`sinfo`、`scontrol`、`sacctmgr`）。如果登录节点仍然偶尔报 `Connection closed`，可以把刷新间隔调大：
 
 ```powershell
-python slurm_tracker.py --web --port 0 --interval 30 --ssh-host sycamore.unc.edu --ssh-user lsr --user lsr
+python slurm_tracker.py --web --port 0 --interval 30 --ssh-host sycamore.unc.edu --ssh-user your_user --user your_user
 ```
 
 只试跑一次并记录本地数据库：
